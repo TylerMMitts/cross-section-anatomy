@@ -25,7 +25,8 @@ import summarise as S
 
 
 def image_key(rel: Path) -> str:
-    return str(rel.with_suffix("")).replace("/", "__")
+    # as_posix: on Windows str() gives Maize\sibs\x, so images in sub-folders never matched their masks
+    return rel.with_suffix("").as_posix().replace("/", "__")
 
 
 OUTPUT_DIRS = {"anatomy", "results"}         # the tool's own outputs, never images to measure
@@ -84,7 +85,7 @@ def batch(image_dir, out_dir=None, diameter=None, redo=False, on_start=None, pro
     for i, rel in enumerate(imgs, 1):
         key = image_key(rel)
         npz = out / "masks" / f"{key}.npz"
-        if npz.exists() and (not redo or P.load_state(npz)[3] == "reviewed"):
+        if npz.exists() and (not redo or P.load_status(npz) == "reviewed"):
             yield i, len(imgs), f"{rel.as_posix()}  (done before)"
             continue
         if on_start:

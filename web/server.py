@@ -151,7 +151,7 @@ def _images(d: Path) -> list[dict]:
         key = RB.image_key(rel)
         npz = d / "anatomy" / "masks" / f"{key}.npz"
         out.append({"image": rel.as_posix(), "key": key,
-                    "status": P.load_state(npz)[3] if npz.exists() else "not measured"})
+                    "status": P.load_status(npz) if npz.exists() else "not measured"})
     return out
 
 

@@ -15,4 +15,6 @@ if [ -x .uv/uv ] && ! cmp -s requirements.txt .venv/installed_requirements.txt; 
   .uv/uv pip install --python .venv/bin/python -r requirements.txt || { echo "Updating failed. Send Jagdeep a screenshot."; read -r; exit 1; }
   cp requirements.txt .venv/installed_requirements.txt
 fi
+# Qt 6 needs libxcb-cursor, which Hellbender's desktops lack: a copy in .libs/ (no admin rights needed) is used
+[ -d .libs ] && export LD_LIBRARY_PATH="$PWD/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 .venv/bin/python -W ignore review.py

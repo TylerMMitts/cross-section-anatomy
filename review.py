@@ -46,6 +46,7 @@ from napari.qt.threading import thread_worker
 from napari.utils.colormaps import DirectLabelColormap
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from qtpy.QtCore import QEvent, QObject, QProcess, QProcessEnvironment, QSize, Qt, QTimer
 from qtpy.QtWidgets import QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QScrollArea, QSizePolicy, QWidget
 from scipy import ndimage as ndi
@@ -145,6 +146,7 @@ class WindowEvents(QObject):
 class Reviewer:
     def __init__(self, anatomy_dir: Path | None = None, show: bool = True):
         self.dir, self.files, self.i, self.busy = None, [], None, False
+        self._pool, self._grays = ThreadPoolExecutor(1), {}   # the next / previous image, read ahead
         self.viewer = napari.Viewer(title="Root cross-section anatomy", show=show)
         self.target = "Cell"
         self._build_dock()
@@ -173,7 +175,7 @@ class Reviewer:
             return
         with self.pick.changed.blocked():
             self.pick.choices = self._choices()
-        first = next((k for k, f in enumerate(self.files) if P.load_state(f)[3] != "reviewed"), 0)
+        first = next((k for k, f in enumerate(self.files) if P.load_status(f) != "reviewed"), 0)
         self.open(first)
 
     # ---------------------------------------------------------- measure / scale / summarise
@@ -512,7 +514,7 @@ class Reviewer:
                 lyr.opacity, lyr.visible = self._base[lyr] * a, a > 0
 
     def _choices(self):
-        return [f.stem + ("  ✓" if P.load_state(f)[3] == "reviewed" else "") for f in self.files]
+        return [f.stem + ("  ✓" if P.load_status(f) == "reviewed" else "") for f in self.files]
 
     # ---------------------------------------------------------- image I/O
     def open(self, i: int):
@@ -523,7 +525,7 @@ class Reviewer:
         f = self.files[i]
         z = np.load(f)
         self.rel = str(z["image_file"])
-        self.gray = P.load_gray(self.image_dir / self.rel)
+        self.gray = self._gray(self.image_dir / self.rel)
         cells, region, mx, self.status = P.load_state(f)
         v = self.viewer
         v.layers.clear()
@@ -535,10 +537,10 @@ class Reviewer:
         self.mx = lab(mx, "metaxylem", {None: "red", 0: "transparent"}, 0.6)
         self.root = lab((region >= 1).astype(np.uint8), "root", {None: "lime", 0: "transparent"}, 0.9)
         self.root.contour = 3                   # the root's edge only
-        self.path = lab(np.zeros_like(cells), "file path", {None: "orangered", 0: "transparent"}, 0.55)
+        self.path = lab(np.zeros(cells.shape, np.uint8), "file path", {None: "orangered", 0: "transparent"}, 0.55)
         self.cells = lab(cells, "cells", {None: "yellow", 0: "transparent"}, 0.9)
         self.cells.contour = 1
-        self.air = lab(np.zeros_like(cells), "air spaces", {None: "magenta", 0: "transparent"}, 0.8)
+        self.air = lab(np.zeros(cells.shape, np.uint8), "air spaces", {None: "magenta", 0: "transparent"}, 0.8)
         self.quads = v.add_shapes(name="quadrants + spokes", face_color="transparent")
         self.qlab = v.add_points(np.empty((0, 2)), name="quarter names", size=0)
         self.outline = v.add_shapes(name="outline", edge_color="white", edge_width=1.5, face_color="transparent")
@@ -551,9 +553,9 @@ class Reviewer:
         v.layers.selection.active = self.cells
         self.centre = P.load_centre(f)          # None = the stele centroid
         self.dropped = set(P.load_dropped(f))   # quarters left out (damaged tissue)
-        props, _, _ = P.derive(cells, region, mx, self.angle, self._centre())
         saved = P.load_paths(f)
-        if saved is None:
+        if saved is None:                       # derive only when there are no saved paths: recompute() runs it anyway
+            props, _, _ = P.derive(cells, region, mx, self.angle, self._centre())
             self.spokes, self.path_q, self.path_cells = P.auto_paths(cells, region, props, self.angle, self._centre())
         else:
             self.spokes, self.path_q, self.path_cells = (np.array(a) for a in saved)
@@ -567,6 +569,24 @@ class Reviewer:
             self.pick.choices = self._choices()
             self.pick.value = self._choices()[i]
         self._opened = self._state()
+        self._prefetch()
+
+    def _gray(self, path):
+        """The image as shown (load_gray: ~5 s for a 12 MP photo on a laptop). The images either side are prepared in
+        the background while you look at this one, so < > and Save + next usually find theirs ready."""
+        job = self._grays.pop(path, None)
+        return job.result() if job is not None else P.load_gray(path)
+
+    def _prefetch(self):
+        paths = []
+        for j in (self.i + 1, self.i - 1):
+            if 0 <= j < len(self.files):
+                with np.load(self.files[j]) as z:
+                    paths.append(self.image_dir / str(z["image_file"]))
+        self._grays = {p: job for p, job in self._grays.items() if p in paths}   # at most two kept in memory
+        for p in paths:
+            if p not in self._grays:
+                self._grays[p] = self._pool.submit(P.load_gray, p)
 
     def _state(self):
         """Everything an edit can change, to tell whether the open image was edited."""
@@ -604,7 +624,7 @@ class Reviewer:
         n = len(self.files)
         for k in range(1, n + 1):
             j = (self.i + k) % n
-            if P.load_state(self.files[j])[3] != "reviewed":
+            if P.load_status(self.files[j]) != "reviewed":
                 return self.open(j)
         self.info.value = "All images checked. Click Make results."
 

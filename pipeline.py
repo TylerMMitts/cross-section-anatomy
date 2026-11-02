@@ -67,6 +67,27 @@ def load_gray(path) -> np.ndarray:
     return exposure.equalize_adapthist(im, clip_limit=0.02)
 
 
+def morph(img: np.ndarray, op: str, r: int) -> np.ndarray:
+    """skimage.morphology.<op>(img, disk(r)) (default mode 'reflect'), done by OpenCV: the same pixels, many times
+    faster on a 12 MP image (find_root's closing took ~20 s there). Works on bool masks and on uint16 label images
+    (dilation = largest label within r, as ndi.grey_dilation)."""
+    import cv2
+    k = morphology.disk(r).astype(np.uint8)
+    a = img.view(np.uint8) if img.dtype == bool else img
+    run = lambda f, x: f(x, k, borderType=cv2.BORDER_REFLECT)
+    if op == "dilation":
+        out = run(cv2.dilate, a)
+    elif op == "erosion":
+        out = run(cv2.erode, a)
+    elif op == "closing":
+        out = run(cv2.erode, run(cv2.dilate, a))
+    elif op == "opening":
+        out = run(cv2.dilate, run(cv2.erode, a))
+    else:
+        raise ValueError(op)
+    return out.astype(bool) if img.dtype == bool else out
+
+
 def wall_mask(gray: np.ndarray) -> np.ndarray:
     sm = filters.gaussian(gray, 1)
     return sm > filters.threshold_local(sm, 51, offset=-0.02)
@@ -89,13 +110,13 @@ def segment_cells(gray: np.ndarray, diameter: float | None = None, model_path: s
 def find_root(gray: np.ndarray, cells: np.ndarray) -> np.ndarray:
     sm = filters.gaussian(gray, 2)
     fg = (sm > filters.threshold_li(sm)) | (cells > 0)
-    fg = morphology.closing(fg, morphology.disk(15))
+    fg = morph(fg, "closing", 15)
     fg = ndi.binary_fill_holes(fg)
     lab = measure.label(fg)
     if lab.max() == 0:
         return fg
     biggest = np.argmax(np.bincount(lab.ravel())[1:]) + 1
-    return morphology.opening(lab == biggest, morphology.disk(5))
+    return morph(lab == biggest, "opening", 5)
 
 
 def find_stele(cells: np.ndarray, root: np.ndarray) -> np.ndarray:
@@ -109,7 +130,7 @@ def find_stele(cells: np.ndarray, root: np.ndarray) -> np.ndarray:
     inner = p.r < 0.6
     cut = filters.threshold_otsu(la[inner].values) if inner.sum() > 5 else la.median()
     small = p.label[(la < cut) & (p.r < 0.7)].values
-    m = morphology.closing(np.isin(cells, small), morphology.disk(7))
+    m = morph(np.isin(cells, small), "closing", 7)
     m = ndi.binary_fill_holes(m)
     lab = measure.label(m)
     if lab.max() == 0:
@@ -122,8 +143,8 @@ def find_stele(cells: np.ndarray, root: np.ndarray) -> np.ndarray:
 def find_mx(gray: np.ndarray, cells: np.ndarray, stele: np.ndarray) -> np.ndarray:
     if not stele.any():
         return np.zeros(cells.shape, np.uint16)
-    lumen = ~wall_mask(gray) & morphology.erosion(stele, morphology.disk(3))
-    lumen = morphology.opening(lumen, morphology.disk(2))
+    lumen = ~wall_mask(gray) & morph(stele, "erosion", 3)
+    lumen = morph(lumen, "opening", 2)
     lab = measure.label(lumen)
     st_cells = np.unique(cells[stele & (cells > 0)])
     st_areas = np.bincount(cells[stele].ravel())[st_cells[st_cells > 0]] if len(st_cells) else np.array([100])
@@ -153,12 +174,14 @@ def propose(path, diameter: float | None = None, model_path: str | None = None):
             m = (cells == lbl) & (mx == 0)
             if m.any():
                 mx[m] = mx.max() + 1
-    if mx.any():  # a vessel is not a cell
-        hit = np.unique(cells[mx > 0])
-        frac = {c: (mx[cells == c] > 0).mean() for c in hit if c}
-        cells[np.isin(cells, [c for c, f in frac.items() if f > 0.5])] = 0
+    if mx.any():  # a vessel is not a cell (> half its pixels under a vessel)
+        n = np.bincount(cells.ravel())
+        under = np.bincount(cells[mx > 0], minlength=len(n))
+        frac = np.divide(under, n, out=np.zeros(len(n)), where=n > 0)
+        frac[0] = 0
+        cells[np.isin(cells, np.flatnonzero(frac > 0.5))] = 0
     cells = segmentation.relabel_sequential(cells)[0].astype(np.uint16)
-    mx = measure.label(morphology.closing(mx > 0, morphology.disk(2))).astype(np.uint16)  # one id per vessel
+    mx = measure.label(morph(mx > 0, "closing", 2)).astype(np.uint16)  # one id per vessel
     region = root.astype(np.uint8) + stele.astype(np.uint8)
     return gray, cells, region, mx
 
@@ -178,7 +201,7 @@ def lumen_at(gray: np.ndarray, y: int, x: int, max_area: int) -> np.ndarray:
     if reg.sum() > max_area or reg.sum() < 10:
         yy, xx = np.ogrid[:gray.shape[0], :gray.shape[1]]
         return (yy - y) ** 2 + (xx - x) ** 2 <= 10 ** 2
-    return morphology.dilation(reg, morphology.disk(2))
+    return morph(reg, "dilation", 2)
 
 
 def typical_cell_area(cells: np.ndarray) -> int:
@@ -239,7 +262,7 @@ def add_mx(gray, mx, cells, y, x) -> int:
 
 def cell_adjacency(cells: np.ndarray) -> dict:
     adj: dict[int, set] = {}
-    grown = ndi.grey_dilation(cells, footprint=morphology.disk(3))
+    grown = morph(cells, "dilation", 3)
     m = (grown != cells) & (cells > 0)
     code = np.unique(cells[m].astype(np.int64) * 65536 + grown[m])
     for x, y in zip((code // 65536).tolist(), (code % 65536).tolist()):
@@ -285,6 +308,8 @@ def derive(cells: np.ndarray, region: np.ndarray, mx: np.ndarray, angle_deg: flo
     """Per-cell table (tissue, cortical layer, quadrant) and per-image traits, in pixels."""
     root = region >= 1
     stele = region == 2
+    centre = centre_of(region, centre)               # once: each call is a centre of mass over the whole image
+    prof = radial_profile(region, centre)
     props = pd.DataFrame(measure.regionprops_table(
         cells, properties=("label", "area", "perimeter", "centroid",
                            "axis_major_length", "axis_minor_length")))
@@ -298,12 +323,12 @@ def derive(cells: np.ndarray, region: np.ndarray, mx: np.ndarray, angle_deg: flo
         yi = props.y.round().astype(int).clip(0, cells.shape[0] - 1)
         xi = props.x.round().astype(int).clip(0, cells.shape[1] - 1)
         in_stele = set(props.label[stele[yi, xi]])
-        edge_band = root & ~morphology.erosion(root, morphology.disk(6))
+        edge_band = root & ~morph(root, "erosion", 6)
         edge = set(np.unique(cells[edge_band])) - {0}
         adj = cell_adjacency(cells)
         air = air_spaces(props, adj) - in_stele
         cortex = set(props.label) - in_stele - edge - air
-        boundary = morphology.dilation(stele, morphology.disk(6)) & ~stele
+        boundary = morph(stele, "dilation", 6) & ~stele
         seed = (set(np.unique(cells[boundary])) - {0}) & cortex
         layer = {c: 1 for c in seed}
         frontier, k = set(seed), 1
@@ -316,20 +341,20 @@ def derive(cells: np.ndarray, region: np.ndarray, mx: np.ndarray, angle_deg: flo
                                    np.where(props.label.isin(edge), "epidermis",
                                             np.where(props.label.isin(layer.keys()), "cortex", "unassigned"))))
         props["layer"] = props.label.map(layer)
-        props["quadrant"] = quadrant_of(props.y, props.x, centre_of(region, centre), angle_deg)
-        props = props.join(radial_position(props, region, centre_of(region, centre)))
+        props["quadrant"] = quadrant_of(props.y, props.x, centre, angle_deg)
+        props = props.join(radial_position(props, region, centre, prof))
     mxp = pd.DataFrame(measure.regionprops_table(mx, properties=("label", "area"))) if mx.any() else pd.DataFrame(columns=["label", "area"])
     traits = {
         "root_area_px": int(root.sum()),
         "stele_area_px": int(stele.sum()),
         "cortex_area_px": int(root.sum() - stele.sum()),
-        "n_cortical_layers": float(np.median([np.median([ray_layers(cells, region, props, centre_of(region, centre), t) for t in ts])
+        "n_cortical_layers": float(np.median([np.median([ray_layers(cells, region, props, centre, t) for t in ts])
                                               for ts in quadrant_rays(angle_deg).values()])) if len(props) else 0,
         "n_layers_ring": int(props.layer.max()) if props.layer.notna().any() else 0,
         "n_cortex_cells": int((props.tissue == "cortex").sum()),
         "n_air_spaces": int((props.tissue == "air_space").sum()),
         "air_space_total_area_px": int(props.area_px[props.tissue == "air_space"].sum()),
-        "cortex_width_px": float(np.mean(np.subtract(*radial_profile(region, centre_of(region, centre))[::-1]))),
+        "cortex_width_px": float(np.mean(np.subtract(*prof[::-1]))),
         "mx_n": int(len(mxp)),
         "mx_mean_area_px": float(mxp.area.mean()) if len(mxp) else np.nan,
         "mx_total_area_px": int(mxp.area.sum()) if len(mxp) else 0,
@@ -349,9 +374,10 @@ def radial_profile(region: np.ndarray, centre, n_angles: int = 360):
     return last(v == 2).astype(float), last(v >= 1).astype(float)
 
 
-def radial_position(props: pd.DataFrame, region: np.ndarray, centre) -> pd.DataFrame:
-    """r_norm: 0 at the stele edge, 1 at the root edge, along each cell's own direction."""
-    r_st, r_rt = radial_profile(region, centre)
+def radial_position(props: pd.DataFrame, region: np.ndarray, centre, prof=None) -> pd.DataFrame:
+    """r_norm: 0 at the stele edge, 1 at the root edge, along each cell's own direction.
+    prof: radial_profile(region, centre) if the caller has it already."""
+    r_st, r_rt = prof if prof is not None else radial_profile(region, centre)
     dy, dx = -(props.y - centre[0]), props.x - centre[1]
     deg = np.mod(np.round(np.degrees(np.arctan2(dy, dx))), 360).astype(int)
     r = np.hypot(dy, dx)
@@ -413,10 +439,11 @@ def path_along(cells, region, props, theta_deg, min_frac=0.3, centre=None) -> li
     return [v for v, L in run.items() if L >= min_frac * ok.at[v, "minor_px"]]
 
 
-def spoke_completeness(cells, region, props, theta_deg, centre=None) -> float:
-    """Share of the spoke between stele edge and root edge that lies in cortical cells."""
+def spoke_completeness(cells, region, props, theta_deg, centre=None, prof=None) -> float:
+    """Share of the spoke between stele edge and root edge that lies in cortical cells.
+    prof: radial_profile(region, centre) if the caller has it already (best_spoke tries ~130 spokes per image)."""
     centre = centre_of(region, centre)
-    r_st, r_rt = radial_profile(region, centre)
+    r_st, r_rt = prof if prof is not None else radial_profile(region, centre)
     d = int(np.mod(round(theta_deg), 360))
     if r_rt[d] - r_st[d] < 10:
         return 0.0
@@ -425,15 +452,19 @@ def spoke_completeness(cells, region, props, theta_deg, centre=None) -> float:
     return float(np.isin(cells[y, x], list(good)).mean()) if len(y) else 0.0
 
 
-def best_spoke(cells, region, props, quadrant, angle_deg=0, margin=12, step=2, centre=None) -> float:
+def best_spoke(cells, region, props, quadrant, angle_deg=0, margin=12, step=2, centre=None, prof=None) -> float:
+    centre = centre_of(region, centre)
+    prof = prof if prof is not None else radial_profile(region, centre)
     lo = angle_deg + 90 * (quadrant - 1) + margin
     cand = np.arange(lo, lo + 90 - 2 * margin + 1, step)
-    score = [spoke_completeness(cells, region, props, t, centre) - 0.001 * abs(t - (lo - margin + 45)) for t in cand]
+    score = [spoke_completeness(cells, region, props, t, centre, prof) - 0.001 * abs(t - (lo - margin + 45)) for t in cand]
     return float(cand[int(np.argmax(score))])
 
 
 def auto_paths(cells, region, props, angle_deg=0, centre=None):
-    spokes = np.array([best_spoke(cells, region, props, q, angle_deg, centre=centre) for q in (1, 2, 3, 4)])
+    centre = centre_of(region, centre)
+    prof = radial_profile(region, centre)
+    spokes = np.array([best_spoke(cells, region, props, q, angle_deg, centre=centre, prof=prof) for q in (1, 2, 3, 4)])
     pq, pc = [], []
     for q, t in zip((1, 2, 3, 4), spokes):
         for lbl in path_along(cells, region, props, t, centre=centre):
@@ -679,6 +710,20 @@ def load_state(npz_path):
     return z["cells"], z["region"], z["mx"], str(z["status"])
 
 
+_STATUS: dict = {}
+
+
+def load_status(npz_path) -> str:
+    """auto | reviewed, without unpacking the masks (the image list asks this of every image on each step).
+    Remembered until the file changes."""
+    st = os.stat(npz_path)
+    key = (str(npz_path), st.st_mtime_ns, st.st_size)
+    if key not in _STATUS:
+        with np.load(npz_path, allow_pickle=False) as z:
+            _STATUS[key] = str(z["status"])
+    return _STATUS[key]
+
+
 def qc_png(gray, cells, region, mx, props, traits, out_png, title=""):
     import matplotlib
     matplotlib.use("Agg")
@@ -711,14 +756,21 @@ def qc_png(gray, cells, region, mx, props, traits, out_png, title=""):
     plt.close(fig)
 
 
+_SAMPLES: dict = {}
+
+
 def um_per_px(anatomy_dir, rel: str) -> float:
-    """Scale for one image, always from the user: um_per_px in samples.xlsx; NaN if not filled yet."""
-    import pandas as pd
+    """Scale for one image, always from the user: um_per_px in samples.xlsx; NaN if not filled yet.
+    The sheet is read again only when the file changes (opening an image asked for it twice, each a full Excel read)."""
     f = Path(anatomy_dir) / "samples.xlsx"
     if f.exists():
-        s = pd.read_excel(f, dtype={"image_file": str}).set_index("image_file")
-        if rel in s.index and pd.notna(s.at[rel, "um_per_px"]):
-            return float(s.at[rel, "um_per_px"])
+        st = f.stat()
+        key = (str(f.resolve()), st.st_mtime_ns, st.st_size)
+        if key not in _SAMPLES:
+            s = pd.read_excel(f, dtype={"image_file": str})
+            _SAMPLES.clear()
+            _SAMPLES[key] = {r: float(v) for r, v in zip(s.image_file, s.um_per_px) if pd.notna(v)} if "um_per_px" in s else {}
+        return _SAMPLES[key].get(rel, np.nan)
     return np.nan
 
 
