@@ -216,12 +216,13 @@ def gray_png(d: Path, rel: str) -> Path:
 
 
 OVERLAY = {"cell": (80, 255, 120, 200), "root": (255, 220, 0, 255), "stele": (0, 220, 255, 255),
-           "mx": (255, 60, 60, 110), "path": (255, 150, 0, 120), "stele_fill": (0, 220, 255, 85)}
+           "mx": (255, 60, 60, 110), "stele_fill": (0, 220, 255, 85)}
 
 
 def overlay_png(d: Path, rel: str, part: str) -> Path:
     """One transparent layer over the image, so the page fades them separately (as the desktop's opacities):
-    part "cells" = the cell outlines; "masks" = root edge, stele (shaded + edge), metaxylem and the path cells."""
+    part "cells" = the cell outlines; "masks" = root edge, stele (shaded + edge), metaxylem. Excluded sectors are
+    drawn by the page (from traits), so changing one needs no new picture."""
     key = RB.image_key(Path(rel))
     npz = d / "anatomy" / "masks" / f"{key}.npz"
     f = _cache(d, key, part)
@@ -232,9 +233,7 @@ def overlay_png(d: Path, rel: str, part: str) -> Path:
     if part == "cells":
         rgba[find_boundaries(cells, mode="inner") & (cells > 0)] = OVERLAY["cell"]
     else:
-        _, path_q, path_cells = P.load_paths(npz) or ((), np.array([]), np.array([]))
         rgba[region == 2] = OVERLAY["stele_fill"]      # the stele is an area: lightly shaded, its cells still visible
-        rgba[np.isin(cells, path_cells) & (cells > 0)] = OVERLAY["path"]
         rgba[mx > 0] = OVERLAY["mx"]
         w = max(2, round(max(cells.shape) / 600))      # root and stele edges thick enough to see on a whole-image view
         edge = lambda m: ndi.binary_dilation(find_boundaries(m, mode="inner") & m, iterations=w) & m
@@ -426,21 +425,23 @@ def traits(name: str, rel: str, u: dict = Depends(user)):
         raise HTTPException(404, "Not measured yet")
     cells, region, mx, status = P.load_state(npz)
     settings = json.loads((d / "anatomy" / "settings.json").read_text())
-    angle, centre, dropped = float(settings.get("quadrant_angle_deg", 0)), P.centre_of(region, P.load_centre(npz)), P.load_dropped(npz)
-    props, _, tr = P.derive(cells, region, mx, angle, centre)
-    spokes, path_q, _ = P.load_paths(npz) or (np.array([]), np.array([]), None)
-    tr["files_per_quarter"] = [None if q in dropped else int((np.asarray(path_q) == q).sum()) for q in (1, 2, 3, 4)]
+    centre = P.centre_of(region, P.load_centre(npz))
+    arcs = P.load_sectors(npz, float(settings.get("quadrant_angle_deg", 0)))
+    props, _, tr = P.derive(cells, region, mx, 0, centre)
+    props = P.exclude_sectors(props, arcs)
+    tr.update(P.sector_traits(cells, region, props, centre, arcs))   # cortex: kept angles; stele, vessels: whole
+    tr.pop("cortex_area_px", None)
     tr["status"] = status
-    # for drawing the quarter lines, the file-path spokes and dropped quarters on the page (as review.py does)
-    tr["quarters"] = {"centre": [float(c) for c in centre], "angle": angle, "dropped": list(dropped),
-                      "spokes": [float(t) for t in np.asarray(spokes).ravel()]}
-    return {k: (None if isinstance(v, float) and np.isnan(v) else v) for k, v in tr.items()}
+    # for drawing the excluded arcs on the page (as review.py does)
+    tr["sectors"] = {"centre": [float(c) for c in centre], "arcs": [[float(a), float(b), r] for a, b, r in arcs]}
+    clean = lambda v: None if isinstance(v, float) and np.isnan(v) else v.item() if isinstance(v, np.generic) else v
+    return {k: clean(v) for k, v in tr.items()}
 
 
 @app.get("/api/projects/{name}/pattern")
 def pattern(name: str, rel: str, u: dict = Depends(user)):
-    """This image's cortex pattern, live from its current masks (review.py's live plot): cell size per quarter
-    along the spoke and over all cortical cells. Redrawn when the mask or the scale changes."""
+    """This image's cortex pattern, live from its current masks (review.py's live plot): kept cortical cells, median
+    area per radial bin, the epidermis its own point. Redrawn when the mask, its sectors or the scale change."""
     import matplotlib.pyplot as plt
     import pattern_plots as PP
     d = _project(u, name)
@@ -455,20 +456,18 @@ def pattern(name: str, rel: str, u: dict = Depends(user)):
     if not f.exists() or f.stat().st_mtime < newest:
         cells, region, mx, _ = P.load_state(npz)
         settings = json.loads((d / "anatomy" / "settings.json").read_text())
-        angle, centre, dropped = float(settings.get("quadrant_angle_deg", 0)), P.centre_of(region, P.load_centre(npz)), P.load_dropped(npz)
-        props, _, _ = P.derive(cells, region, mx, angle, centre)
-        props = P.drop_quarters(props, dropped)
-        paths = P.load_paths(npz) or P.auto_paths(cells, region, props, angle, centre)
-        ft = P.file_table(cells, region, props, paths[1], paths[2], dropped)
+        centre = P.centre_of(region, P.load_centre(npz))
+        arcs = P.load_sectors(npz, float(settings.get("quadrant_angle_deg", 0)))
+        props = P.exclude_sectors(P.derive(cells, region, mx, 0, centre)[0], arcs)
+        prof = P.sector_profile(props, SUM.N_BINS)
         sc = P.um_per_px(d / "anatomy", rel)
         um = not np.isnan(sc)
         sc = sc if um else 1
-        fig, axs = plt.subplots(2, 1, figsize=(3.4, 4.6), dpi=150, layout="constrained")
-        PP.quadrant_profiles(axs, ft.assign(area=ft.area_px * sc * sc), props.assign(area=props.area_px * sc * sc),
-                             "area", "Cell area (µm²)" if um else "Cell area (px)", fontsize=7, compact=True)
-        for ax in axs:
-            ax.tick_params(labelsize=7)
-            ax.xaxis.label.set_size(8), ax.yaxis.label.set_size(8), ax.title.set_size(8)
+        fig, ax = plt.subplots(figsize=(3.4, 2.8), dpi=150, layout="constrained")
+        PP.sector_pattern(ax, prof.assign(y=prof.median_area_px * sc * sc), "y",
+                          "Cell area (µm²)" if um else "Cell area (px)", compact=True)
+        ax.tick_params(labelsize=7)
+        ax.xaxis.label.set_size(8), ax.yaxis.label.set_size(8)
         fig.savefig(f)
         plt.close(fig)
     return FileResponse(f, headers={"Cache-Control": "no-cache"})
@@ -497,45 +496,38 @@ def all_traits(name: str, u: dict = Depends(user)):
 
 @app.post("/api/projects/{name}/edit")
 def edit(name: str, rel: str = Form(...), target: str = Form(...), points: str = Form(...),
-         remove: bool = Form(False), move: bool = Form(False), u: dict = Depends(user)):
+         remove: bool = Form(False), reason: str = Form("torn"), u: dict = Depends(user)):
     """A click (one point) or a drawn outline (points [[y, x], ...] in image pixels) on Cell / Metaxylem / Stele /
-    Root, applied with the desktop editor's own rules (pipeline.click_edit / outline_edit); the image becomes
-    'reviewed'. Returns the image's new numbers, plus a note when the edit needs a follow-up."""
+    Root, applied with the desktop editor's own rules (pipeline.click_edit / outline_edit); Sectors: a drag from
+    one side of the damage to the other excludes that arc (first and last point, with a reason), Ctrl/Cmd-click
+    inside an excluded arc brings it back (pipeline.sector_edit). The image becomes 'reviewed'. Returns the image's
+    new numbers, plus a note when the edit needs a follow-up."""
     d = _project(u, name)
     rel = _safe_rel(rel).as_posix()
     npz = d / "anatomy" / "masks" / f"{RB.image_key(Path(rel))}.npz"
     if not npz.exists():
         raise HTTPException(404, "Not measured yet")
-    if target not in ("Cell", "Metaxylem", "Stele", "Root", "Quarters", "File path"):
+    if target not in ("Cell", "Metaxylem", "Stele", "Root", "Sectors"):
         raise HTTPException(400, f"Editing {target} in the browser is not available yet: use the desktop app.")
     pts = np.asarray(json.loads(points), float)
-    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) in (0, 2):
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) == 0 or (len(pts) == 2 and target != "Sectors"):
         raise HTTPException(400, "Click, or hold Shift and drag around the area.")
     cells, region, mx, _ = P.load_state(npz)
-    if target == "Quarters":                 # click = this quarter back in, Ctrl/Cmd-click = drop it (damaged tissue)
+    if target == "Sectors":
         settings = json.loads((d / "anatomy" / "settings.json").read_text())
-        y, x = pts[0]
-        q = int(P.quadrant_of(y, x, P.centre_of(region, P.load_centre(npz)), float(settings.get("quadrant_angle_deg", 0))))
-        dropped = set(P.load_dropped(npz))
-        dropped = dropped | {q} if remove else dropped - {q}
-        P.save_edit(npz, dropped_q=np.array(sorted(dropped), np.int16))
-        return {**traits(name, rel, u), "note": f"Q{q} " + ("dropped from the results." if q in dropped else "in the results.")}
-    cells, region, mx = cells.copy(), region.copy(), mx.copy()
-    if target == "File path":                # click / Ctrl-click a cell, Shift-drag cells, Alt-click = move the spoke
-        settings = json.loads((d / "anatomy" / "settings.json").read_text())
-        angle, centre, dropped = float(settings.get("quadrant_angle_deg", 0)), P.centre_of(region, P.load_centre(npz)), P.load_dropped(npz)
-        props = P.drop_quarters(P.derive(cells, region, mx, angle, centre)[0], dropped)
-        spokes, pq, pc = P.load_paths(npz) or P.auto_paths(cells, region, props, angle, centre)
-        if len(pts) == 1:
-            y, x = (int(round(v)) for v in pts[0])
-            if not (0 <= y < cells.shape[0] and 0 <= x < cells.shape[1]):
-                raise HTTPException(400, "Click on the image.")
-            spokes, pq, pc = P.path_edit(cells, region, props, spokes, pq, pc, centre, angle, (y, x), remove, move)
-        else:
-            spokes, pq, pc = P.path_edit(cells, region, props, spokes, pq, pc, centre, angle, None, remove,
-                                         m=P.outline_mask(pts, cells.shape))
-        P.save_edit(npz, cells=cells, spokes=spokes, path_q=pq, path_cells=pc)
+        centre = P.centre_of(region, P.load_centre(npz))
+        arcs = P.load_sectors(npz, float(settings.get("quadrant_angle_deg", 0)))
+        if len(pts) == 1 and not remove:
+            return {**traits(name, rel, u), "note": "Sectors: drag around the stele across the damage to exclude it; "
+                                                    "Ctrl/Cmd-click an excluded arc to bring it back."}
+        new = P.sector_edit(arcs, centre, tuple(pts[0]), None if len(pts) == 1 else tuple(pts[-1]),
+                            reason, remove=len(pts) == 1)
+        if new == arcs:
+            return {**traits(name, rel, u), "note": "Nothing changed (drag further round the stele)." if len(pts) > 1
+                    else "No excluded arc there."}
+        P.save_edit(npz, **P.sector_arrays(new))
         return {**traits(name, rel, u), "note": ""}
+    cells, region, mx = cells.copy(), region.copy(), mx.copy()
     note = ""
     if len(pts) == 1:
         y, x = (int(round(v)) for v in pts[0])

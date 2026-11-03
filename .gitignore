@@ -9,3 +9,4 @@ __pycache__/
 examples/*/anatomy/qc/
 examples/*/results/
 web_data/
+tests/output/

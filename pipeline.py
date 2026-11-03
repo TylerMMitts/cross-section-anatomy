@@ -263,26 +263,16 @@ def air_spaces(props: pd.DataFrame, adj: dict) -> set:
 
 
 def centre_of(region: np.ndarray, centre=None) -> tuple[float, float]:
-    """The origin for quadrants: the user's centre if set, else the stele centroid (root centroid if no stele)."""
+    """The origin for sectors and radial position: the user's centre if set, else the stele centroid (root centroid if no stele)."""
     if centre is not None:
         return float(centre[0]), float(centre[1])
     m = region == 2 if (region == 2).any() else region >= 1
     return ndi.center_of_mass(m) if m.any() else (region.shape[0] / 2, region.shape[1] / 2)
 
 
-def quadrant_of(y, x, centre, angle_deg: float = 0):
-    """Q1 top-right, Q2 top-left, Q3 bottom-left, Q4 bottom-right (image axes, rotated by angle_deg)."""
-    theta = np.degrees(np.arctan2(-(np.asarray(y) - centre[0]), np.asarray(x) - centre[1])) - angle_deg
-    return (np.floor(np.mod(theta, 360) / 90) + 1).astype(int)
-
-
-def quadrant_map(shape, centre, angle_deg: float = 0) -> np.ndarray:
-    yy, xx = np.mgrid[:shape[0], :shape[1]]
-    return quadrant_of(yy, xx, centre, angle_deg)
-
-
 def derive(cells: np.ndarray, region: np.ndarray, mx: np.ndarray, angle_deg: float = 0, centre=None):
-    """Per-cell table (tissue, cortical layer, quadrant) and per-image traits, in pixels."""
+    """Per-cell table (tissue, cortical layer, angle, radial position) and per-image traits, in pixels, whole section.
+    angle_deg is unused (kept for old callers); sectors are applied afterwards (exclude_sectors, sector_traits)."""
     root = region >= 1
     stele = region == 2
     props = pd.DataFrame(measure.regionprops_table(
@@ -316,15 +306,14 @@ def derive(cells: np.ndarray, region: np.ndarray, mx: np.ndarray, angle_deg: flo
                                    np.where(props.label.isin(edge), "epidermis",
                                             np.where(props.label.isin(layer.keys()), "cortex", "unassigned"))))
         props["layer"] = props.label.map(layer)
-        props["quadrant"] = quadrant_of(props.y, props.x, centre_of(region, centre), angle_deg)
         props = props.join(radial_position(props, region, centre_of(region, centre)))
     mxp = pd.DataFrame(measure.regionprops_table(mx, properties=("label", "area"))) if mx.any() else pd.DataFrame(columns=["label", "area"])
     traits = {
         "root_area_px": int(root.sum()),
         "stele_area_px": int(stele.sum()),
         "cortex_area_px": int(root.sum() - stele.sum()),
-        "n_cortical_layers": float(np.median([np.median([ray_layers(cells, region, props, centre_of(region, centre), t) for t in ts])
-                                              for ts in quadrant_rays(angle_deg).values()])) if len(props) else 0,
+        "n_cortical_layers": float(np.median([ray_layers(cells, region, props, centre_of(region, centre), t)
+                                              for t in RAY_ANGLES])) if len(props) else 0,
         "n_layers_ring": int(props.layer.max()) if props.layer.notna().any() else 0,
         "n_cortex_cells": int((props.tissue == "cortex").sum()),
         "n_air_spaces": int((props.tissue == "air_space").sum()),
@@ -362,7 +351,8 @@ def radial_position(props: pd.DataFrame, region: np.ndarray, centre) -> pd.DataF
                          "cortex_width_px": width}, index=props.index)
 
 
-RAY_OFFSETS = (-20, -10, 0, 10, 20)   # degrees around each quadrant's centre line
+RAY_ANGLES = np.arange(2.5, 360, 5)  # layer counts: one ray every 5 degrees (only the kept ones count), off the
+                                     # round angles so a ray does not run along a radial wall drawn at one
 
 
 def ray_layers(cells, region, props, centre, theta_deg: float) -> int:
@@ -373,122 +363,146 @@ def ray_layers(cells, region, props, centre, theta_deg: float) -> int:
     y = np.round(centre[0] - r * np.sin(t)).astype(int)
     x = np.round(centre[1] + r * np.cos(t)).astype(int)
     ok = (y >= 0) & (y < cells.shape[0]) & (x >= 0) & (x < cells.shape[1])
-    seen = []
-    for lbl in cells[y[ok], x[ok]]:
-        if lbl in cortex and (not seen or seen[-1] != lbl):
-            seen.append(int(lbl))
-    return len(set(seen))
+    lab = cells[y[ok], x[ok]]
+    run = np.r_[True, lab[1:] != lab[:-1]].cumsum()            # runs of the same label along the ray
+    n = np.bincount(run)
+    # a cell counts when the ray stays in it >= 2 px (a ray grazing a wall corner is not a layer)
+    return len({int(l) for l, k in zip(lab, run) if l in cortex and n[k] >= 2})
 
 
-def quadrant_rays(angle_deg: float = 0):
-    """{quadrant: [ray angles]}; image-axis angles, counter-clockwise from the right."""
-    return {k: [angle_deg + 45 + 90 * (k - 1) + o for o in RAY_OFFSETS] for k in (1, 2, 3, 4)}
+# ---------------------------------------------------------------- sectors (decided with Jagdeep 2026-11-02)
+# The whole section counts by default; the user takes out damaged arcs ("excluded sectors"), each with a technical
+# reason. Biology (aerenchyma, collapsed or irregular cells) is never a reason: it is measured, not removed.
+# A sector is an arc of angles around the stele centre, stored as start/end degrees (counter-clockwise from the
+# image's right, the same convention as angle_rad). A cell belongs to the arc its CENTRE lies in (no size bias from
+# dropping cells cut by the edge). Sectors touch only cortex, epidermis, air spaces and unassigned cells; the stele
+# and metaxylem are always whole-section (an unusable stele is excluded with the image, not with a sector).
+# Nothing refers to cell labels, so cell edits never leave a sector stale.
+
+SECTOR_REASONS = ("torn", "folded", "smeared / oblique", "out of focus", "debris", "other")
+SECTOR_TISSUES = ("cortex", "epidermis", "air_space", "unassigned")
+MIN_KEPT_DEG = 45          # below this the image is flagged low_coverage
+MIN_CELLS_PER_BIN = 5      # a profile bin with fewer cortical cells is flagged
 
 
-# ---------------------------------------------------------------- file paths (cell size by file)
-# One spoke per quadrant; the cells along it, ordered from the stele out, are files 1..n.
-# The spoke is picked where the cortex is most complete; the user can re-pick it and add or
-# remove cells (the path may zig-zag). Stored per image as spokes (4,), path_q, path_cells.
-
-PATH_TISSUES = ("cortex", "unassigned")   # cells a path may hold (air spaces, stele, epidermis never)
+def angle_of(y, x, centre):
+    """Degrees 0-360, counter-clockwise from the image's right, around centre (y, x)."""
+    return np.mod(np.degrees(np.arctan2(-(np.asarray(y, float) - centre[0]), np.asarray(x, float) - centre[1])), 360)
 
 
-def _ray(shape, centre, theta_deg, r0=0.0, r1=None, step=0.5):
-    t = np.radians(theta_deg)
-    r = np.arange(r0, r1 if r1 is not None else max(shape), step)
-    y = np.round(centre[0] - r * np.sin(t)).astype(int)
-    x = np.round(centre[1] + r * np.cos(t)).astype(int)
-    ok = (y >= 0) & (y < shape[0]) & (x >= 0) & (x < shape[1])
-    return y[ok], x[ok]
+def in_arcs(deg, arcs) -> np.ndarray:
+    """True where the angle lies in any arc (start, end): counter-clockwise from start to end."""
+    deg = np.mod(np.asarray(deg, float), 360)
+    out = np.zeros(deg.shape, bool)
+    for a, b, *_ in arcs:
+        a, b = a % 360, b % 360
+        out |= ((deg >= a) & (deg < b)) if a <= b else ((deg >= a) | (deg < b))
+    return out
 
 
-def path_along(cells, region, props, theta_deg, min_frac=0.3, centre=None) -> list[int]:
-    """Cells a spoke really crosses (>= min_frac of the cell's minor axis), stele -> edge."""
-    ok = props[props.tissue.isin(PATH_TISSUES)].set_index("label")
-    y, x = _ray(cells.shape, centre_of(region, centre), theta_deg)
-    run: dict[int, float] = {}
-    for v in cells[y, x]:
-        if v in ok.index:
-            run[int(v)] = run.get(int(v), 0) + 0.5
-    return [v for v, L in run.items() if L >= min_frac * ok.at[v, "minor_px"]]
+def kept_deg(arcs) -> float:
+    """Degrees of the circle not covered by any excluded arc (overlaps counted once)."""
+    return float(360 - in_arcs(np.arange(0, 360, 0.25) + 0.125, arcs).sum() * 0.25)
 
 
-def spoke_completeness(cells, region, props, theta_deg, centre=None) -> float:
-    """Share of the spoke between stele edge and root edge that lies in cortical cells."""
-    centre = centre_of(region, centre)
-    r_st, r_rt = radial_profile(region, centre)
-    d = int(np.mod(round(theta_deg), 360))
-    if r_rt[d] - r_st[d] < 10:
-        return 0.0
-    y, x = _ray(cells.shape, centre, theta_deg, r_st[d] + 2, r_rt[d] - 2)
-    good = set(props.label[props.tissue == "cortex"])
-    return float(np.isin(cells[y, x], list(good)).mean()) if len(y) else 0.0
-
-
-def best_spoke(cells, region, props, quadrant, angle_deg=0, margin=12, step=2, centre=None) -> float:
-    lo = angle_deg + 90 * (quadrant - 1) + margin
-    cand = np.arange(lo, lo + 90 - 2 * margin + 1, step)
-    score = [spoke_completeness(cells, region, props, t, centre) - 0.001 * abs(t - (lo - margin + 45)) for t in cand]
-    return float(cand[int(np.argmax(score))])
-
-
-def auto_paths(cells, region, props, angle_deg=0, centre=None):
-    spokes = np.array([best_spoke(cells, region, props, q, angle_deg, centre=centre) for q in (1, 2, 3, 4)])
-    pq, pc = [], []
-    for q, t in zip((1, 2, 3, 4), spokes):
-        for lbl in path_along(cells, region, props, t, centre=centre):
-            pq.append(q)
-            pc.append(lbl)
-    return spokes, np.array(pq, np.int16), np.array(pc, np.int32)
-
-
-def load_paths(npz_path):
+def load_sectors(npz_path, angle_deg: float = 0) -> list:
+    """Excluded arcs [(start, end, reason)]. Old projects: each dropped quarter becomes a 90 degree arc."""
     z = np.load(npz_path, allow_pickle=False)
-    if "spokes" not in z:
-        return None
-    return z["spokes"], z["path_q"], z["path_cells"]
+    if "excl_start" in z:
+        return [(float(a), float(b), str(r)) for a, b, r in zip(z["excl_start"], z["excl_end"], z["excl_reason"])]
+    if "dropped_q" in z:
+        return [(angle_deg + 90 * (int(q) - 1), angle_deg + 90 * int(q), "dropped quarter (before sectors)")
+                for q in z["dropped_q"]]
+    return []
 
 
-def file_table(cells, region, props, path_q, path_cells, dropped=()) -> pd.DataFrame:
-    """One row per path cell: quadrant, file (1 = next to the stele), size, radial position."""
-    p = props.set_index("label")
-    # the user's choice wins: any cell except stele and air spaces (auto paths only take cortex)
-    keep = [(int(q), int(c)) for q, c in zip(path_q, path_cells)
-            if int(q) not in dropped and c in p.index and p.at[c, "tissue"] not in ("stele", "air_space")]
-    if not keep:
-        return pd.DataFrame(columns=["quadrant", "file", "label"])
-    t = pd.DataFrame(keep, columns=["quadrant", "label"]).drop_duplicates("label")
-    t = t.join(p[["area_px", "major_px", "minor_px", "r_norm", "dist_from_stele_px"]], on="label")
-    t = t.sort_values(["quadrant", "dist_from_stele_px"])
-    t["file"] = t.groupby("quadrant").cumcount() + 1
-    return t[["quadrant", "file", "label", "area_px", "major_px", "minor_px", "r_norm", "dist_from_stele_px"]]
+def sector_arrays(arcs) -> dict:
+    """The arcs as npz fields (save_edit(npz, **sector_arrays(arcs)))."""
+    return {"excl_start": np.array([a for a, _, _ in arcs], float), "excl_end": np.array([b for _, b, _ in arcs], float),
+            "excl_reason": np.array([r for _, _, r in arcs], dtype="U40")}
 
 
-def quadrant_traits(cells, region, mx, props, angle_deg: float = 0, centre=None) -> pd.DataFrame:
-    """One row per quadrant: areas, layers, cortex cells, air spaces, metaxylem (pixels)."""
+def sector_edit(arcs, centre, p0, p1=None, reason="torn", remove=False) -> list:
+    """Shared by the desktop editor and the web page. Drag p0 -> p1 (image (y, x)): the smaller arc between the two
+    directions is excluded (a wider one takes two drags). remove: the excluded arc(s) holding p0's direction come
+    back. A click without a drag changes nothing."""
+    arcs = list(arcs)
+    t0 = float(angle_of(*p0, centre))
+    if remove:
+        return [a for a in arcs if not in_arcs([t0], [a])[0]]
+    if p1 is None:
+        return arcs
+    t1 = float(angle_of(*p1, centre))
+    d = (t1 - t0) % 360
+    a, b = (t0, t1) if d <= 180 else (t1, t0)
+    if min(d, 360 - d) < 2:                     # not a sector, a click
+        return arcs
+    return arcs + [(round(a, 1) % 360, round(b, 1) % 360, reason if reason in SECTOR_REASONS else "other")]
+
+
+def exclude_sectors(props, arcs):
+    """Cells whose centre is in an excluded arc get tissue '<tissue>_excluded' (kept in all_cells, out of every
+    cortex number). Stele cells are never touched."""
+    if not arcs or not len(props):
+        return props
+    props = props.copy()
+    out = in_arcs(np.degrees(props.angle_rad), arcs) & props.tissue.isin(SECTOR_TISSUES)
+    props.loc[out, "tissue"] = props.tissue[out] + "_excluded"
+    return props
+
+
+def sector_traits(cells, region, props, centre, arcs) -> dict:
+    """Cortex traits from the kept angles only, plus whole-section estimates scaled by 360 / kept degrees (they
+    assume the excluded arcs looked like the kept ones: marked _est). props: after exclude_sectors."""
     centre = centre_of(region, centre)
-    q = quadrant_map(region.shape, centre, angle_deg)
-    mxp = pd.DataFrame(measure.regionprops_table(mx, properties=("label", "area", "centroid"))) if mx.any() else None
-    rows = []
-    for k in (1, 2, 3, 4):
-        inq = q == k
-        c = props[(props.get("quadrant") == k) & (props.tissue == "cortex")] if len(props) else props
-        a = props[(props.get("quadrant") == k) & (props.tissue == "air_space")] if len(props) else props
-        mq = mxp[quadrant_of(mxp["centroid-0"], mxp["centroid-1"], centre, angle_deg) == k] if mxp is not None else []
-        rays = [ray_layers(cells, region, props, centre, t) for t in quadrant_rays(angle_deg)[k]] if len(props) else [0]
-        rows.append({"quadrant": k,
-                     "n_layers_ray": float(np.median(rays)),
-                     "n_layers_ray_min": int(min(rays)), "n_layers_ray_max": int(max(rays)),
-                     "root_area_px": int((inq & (region >= 1)).sum()),
-                     "stele_area_px": int((inq & (region == 2)).sum()),
-                     "cortex_area_px": int((inq & (region == 1)).sum()),
-                     "n_layers_ring": int(c.layer.max()) if len(c) else 0,
-                     "n_cortex_cells": len(c),
-                     "mean_cortex_cell_area_px": float(c.area_px.mean()) if len(c) else np.nan,
-                     "n_air_spaces": len(a),
-                     "air_space_total_area_px": int(a.area_px.sum()) if len(a) else 0,
-                     "mx_n": len(mq)})
-    return pd.DataFrame(rows)
+    kept = kept_deg(arcs)
+    yy, xx = np.nonzero(region >= 1)
+    outer = region[yy, xx] == 1                                 # root outside the stele (cortex + epidermis)
+    keep_px = ~in_arcs(angle_of(yy, xx, centre), arcs)
+    scale = 360 / kept if kept > 0 else np.nan
+    r_st, r_rt = radial_profile(region, centre)
+    keep_deg_mask = ~in_arcs(np.arange(360) + 0.5, arcs)
+    rays = [ray_layers(cells, region, props, centre, t) for t in RAY_ANGLES if not in_arcs([t], arcs)[0]]
+    c = props[props.tissue == "cortex"]
+    a = props[props.tissue == "air_space"]
+    stele_px = int((region == 2).sum())
+    ctx_kept = int((outer & keep_px).sum())
+    return {"angle_kept_deg": kept,
+            "excluded_sectors": "; ".join(f"{a_:.0f}-{b_:.0f} {r}" for a_, b_, r in arcs),
+            "low_coverage": bool(kept < MIN_KEPT_DEG),
+            "n_cortical_layers": float(np.median(rays)) if rays else np.nan,
+            "n_cortical_layers_min": int(min(rays)) if rays else np.nan,
+            "n_cortical_layers_max": int(max(rays)) if rays else np.nan,
+            "n_cortex_cells": len(c), "n_air_spaces": len(a),
+            "air_space_total_area_px": int(a.area_px.sum()),
+            "mean_cortex_cell_area_px": float(c.area_px.mean()) if len(c) else np.nan,
+            "median_cortex_cell_area_px": float(c.area_px.median()) if len(c) else np.nan,
+            "cortex_width_px": float(np.mean((r_rt - r_st)[keep_deg_mask])) if keep_deg_mask.any() else np.nan,
+            "cortex_area_kept_px": ctx_kept,
+            "cortex_area_est_px": ctx_kept * scale,
+            "root_area_est_px": stele_px + ctx_kept * scale,
+            "stele_share_est": stele_px / (stele_px + ctx_kept * scale) if kept > 0 else np.nan,
+            "n_cortex_cells_est": len(c) * scale, "n_air_spaces_est": len(a) * scale}
+
+
+def sector_profile(props, n_bins: int = 10) -> pd.DataFrame:
+    """The image's cortex pattern from every kept cortical cell: r_norm in n_bins equal bins (1 = next to the stele;
+    r_norm is normalised along each cell's own direction, so an uneven cortex is not mixed across layers), median
+    cell area per bin, n per bin; then the epidermis as its own last row (bin = 'epidermis'). rel = median / the
+    image's median cortical cell area. props: after exclude_sectors."""
+    c = props[props.tissue == "cortex"]
+    med = c.area_px.median() if len(c) else np.nan
+    b = (np.clip(c.r_norm, 0, 0.999) * n_bins).astype(int) + 1
+    g = c.area_px.groupby(b).agg(["median", "size"]).reindex(range(1, n_bins + 1))
+    rows = [{"bin": str(k), "x": (k - 0.5) / n_bins, "n_cells": int(0 if pd.isna(r["size"]) else r["size"]),
+             "median_area_px": r["median"]} for k, r in g.iterrows()]
+    e = props[props.tissue == "epidermis"]
+    rows.append({"bin": "epidermis", "x": 1 + 0.5 / n_bins, "n_cells": len(e),
+                 "median_area_px": e.area_px.median() if len(e) else np.nan})
+    d = pd.DataFrame(rows)
+    d["rel"] = d.median_area_px / med
+    d["few_cells"] = (d.n_cells < MIN_CELLS_PER_BIN) & (d.bin != "epidermis")
+    return d
 
 
 def layer_image(cells: np.ndarray, props: pd.DataFrame) -> np.ndarray:
@@ -511,24 +525,9 @@ def save_state(npz_path, cells, region, mx, status="auto", **meta):
 
 
 def load_centre(npz_path):
-    """The quadrant centre the user set (y, x), or None: then the stele centroid is used."""
+    """The centre the user set (y, x), or None: then the stele centroid is used."""
     z = np.load(npz_path, allow_pickle=False)
     return tuple(z["centre"]) if "centre" in z else None
-
-
-def load_dropped(npz_path) -> tuple:
-    """Quarters the user dropped (damaged tissue): left out of files and cortical cell sizes."""
-    z = np.load(npz_path, allow_pickle=False)
-    return tuple(int(q) for q in z["dropped_q"]) if "dropped_q" in z else ()
-
-
-def drop_quarters(props, dropped):
-    """Cortical cells and air spaces in a dropped quarter get tissue '..._dropped' (kept in all_cells, out of the means)."""
-    if dropped and len(props):
-        props = props.copy()
-        for t in ("cortex", "air_space"):
-            props.loc[props.quadrant.isin(dropped) & (props.tissue == t), "tissue"] = t + "_dropped"
-    return props
 
 
 def outline_mask(pts, shape) -> np.ndarray:
@@ -619,52 +618,6 @@ def outline_edit(cells, region, mx, target: str, m: np.ndarray, remove: bool = F
         raise ValueError(f"outline_edit: no rule for {target}")
 
 
-def path_edit(cells, region, props, spokes, path_q, path_cells, centre, angle, target_pts, remove=False,
-              move=False, m=None):
-    """File path edits, shared by the desktop editor and the web page. Returns (spokes, path_q, path_cells).
-    click (target_pts = (y, x)): the cell joins its quarter's path, or leaves it if it is on it (remove: leaves).
-    move: the click's quarter gets a new spoke through it, and its path is re-picked along it (path_along).
-    m (a drawn outline): cells mostly inside join (remove: leave); an outline over a gap draws the missing cell
-    first (cells is changed in place then)."""
-    spokes, path_q, path_cells = (np.array(spokes, float).copy(), np.asarray(path_q, np.int16).copy(),
-                                  np.asarray(path_cells, np.int32).copy())
-
-    def add(labels):
-        nonlocal path_q, path_cells
-        for l in labels:
-            if l and l not in path_cells:
-                cy, cx = np.argwhere(cells == l).mean(0)
-                path_q = np.r_[path_q, int(quadrant_of(cy, cx, centre, angle))].astype(np.int16)
-                path_cells = np.r_[path_cells, l].astype(np.int32)
-
-    def drop(labels):
-        nonlocal path_q, path_cells
-        keep = ~np.isin(path_cells, list(labels))
-        path_q, path_cells = path_q[keep], path_cells[keep]
-
-    if m is not None:
-        inside = [int(l) for l in np.unique(cells[m]) if l and (cells[m] == l).sum() >= 0.5 * (cells == l).sum()]
-        if remove:
-            drop(inside)
-        else:
-            if (m & (cells == 0)).sum() > 0.3 * m.sum():      # an outline over a gap draws the missing cell
-                inside.append(take(cells, m, merge=False))
-            add(inside)
-        return spokes, path_q, path_cells
-    y, x = target_pts
-    if move:
-        q = int(quadrant_of(y, x, centre, angle))
-        t = float(np.degrees(np.arctan2(-(y - centre[0]), x - centre[1])))
-        spokes[q - 1] = t
-        keep = path_q != q
-        new = path_along(cells, region, props, t, centre=centre)
-        return spokes, np.r_[path_q[keep], np.full(len(new), q)].astype(np.int16), np.r_[path_cells[keep], new].astype(np.int32)
-    lbl = int(cells[y, x])
-    if lbl:
-        drop([lbl]) if remove or lbl in path_cells else add([lbl])
-    return spokes, path_q, path_cells
-
-
 def save_edit(npz_path, **changes) -> None:
     """Save changed arrays into an image's npz, keeping everything else in it, and mark it reviewed."""
     z = np.load(npz_path, allow_pickle=False)
@@ -696,12 +649,6 @@ def qc_png(gray, cells, region, mx, props, traits, out_png, title=""):
     air = np.isin(cells, props.label[props.tissue == "air_space"].values)
     if air.any():
         ax[1].contour(air, [0.5], colors="magenta", linewidths=0.8)
-    cy, cx = centre_of(region)
-    for a in ax:
-        a.axhline(cy, color="white", lw=0.6, ls="--")
-        a.axvline(cx, color="white", lw=0.6, ls="--")
-    for k, (dy, dx) in zip((1, 2, 3, 4), ((-1, 1), (-1, -1), (1, -1), (1, 1))):
-        ax[0].text(cx + dx * 0.42 * gray.shape[1], cy + dy * 0.42 * gray.shape[0], f"Q{k}", color="white", ha="center", va="center")
     ax[0].set_title("root (yellow), stele (cyan), metaxylem (red)")
     ax[1].imshow(lay, cmap="turbo", alpha=0.55, interpolation="nearest")
     ax[1].set_title(f"cortical layers C1..C{traits['n_cortical_layers']}, air spaces (magenta)")

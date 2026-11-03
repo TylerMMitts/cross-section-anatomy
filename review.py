@@ -9,23 +9,27 @@ Buttons:  Open folder...     the experiment folder, its raw/ (images) or anatomy
           um / pixel         the scale: always typed by you (scale bars are not read)
           Make results       tables + figures -> results/ next to anatomy/
 
-Pick what you are editing (keys 1-6; its name follows the cursor):
-  1 Cell   2 Metaxylem   3 Stele   4 File path   5 Quarters   6 Root (Shift-drag: this outline is the root)
+Pick what you are editing (keys 1-5; its name follows the cursor):
+  1 Cell   2 Metaxylem   3 Stele   4 Sectors   5 Root (Shift-drag: this outline is the root)
 
 The same four gestures work on every target:
   click              add here      cell / vessel: fills the lumen out to its walls
-                                   file path: the cell joins its quarter's path
   Cmd-click          remove what is under the cursor        (Ctrl-click on Windows/Linux)
   Shift-drag         draw an outline -> add it               (cell: new cell; vessel: merges with
-                                   vessels it touches; stele / root: this is the new outline; path: cells inside join)
+                                   vessels it touches; stele / root: this is the new outline)
   Cmd-Shift-drag     draw an outline -> remove everything inside it
   drag               pan   ·   scroll  zoom
-  Alt-click          (file path) move this quarter's spoke through the click
+Sectors (the whole section counts until you take damaged tissue out):
+  Shift-drag         from one side of the damage to the other, around the stele: that arc is excluded (the smaller
+                     way round; a wider one takes two drags), with the reason picked in the bar
+  Cmd-click          inside an excluded arc: it comes back
+  A cell is in or out by its centre. Stele and metaxylem are never excluded. Only technical damage is a reason
+  (torn, folded, smeared / oblique, out of focus, debris): aerenchyma or odd cells are biology, measured, not removed.
 
 One owner per pixel: a drawn cell takes the pixels it overlaps (a neighbour left with < 25% of
 its area is removed), so nothing is counted twice. A vessel clears the cell pixels under it.
 
-Keys:  1-4 target   Shift-H hide overlays   Shift-S save + next   , previous   . next
+Keys:  1-5 target   Shift-H hide overlays   Shift-S save + next   , previous   . next
 """
 from __future__ import annotations
 
@@ -57,16 +61,16 @@ import pipeline as P
 import run_batch as RB
 import summarise as SUM
 
-TARGETS = {"Cell": "yellow", "Metaxylem": "red", "Stele": "cyan", "File path": "orange", "Quarters": "white",
-           "Root": "lime"}
+TARGETS = {"Cell": "yellow", "Metaxylem": "red", "Stele": "cyan", "Sectors": "white", "Root": "lime"}
 # the layers each editing target owns: the opacity slider acts on these only
 TARGET_LAYERS = {"Cell": ("cells", "air"), "Metaxylem": ("mx",), "Stele": ("region",),
-                 "File path": ("path", "nums"), "Quarters": ("quads", "qlab"), "Root": ("root",)}
+                 "Sectors": ("sect", "slab"), "Root": ("root",)}
 CMD = "⌘" if sys.platform == "darwin" else "Ctrl"   # napari's "Control" is Cmd on a Mac
 _KEYS = [("Click", "add"), (f"{CMD}-click", "remove (stele: the whole stele)"), ("Shift-drag", "draw outline, add"),
          (f"{CMD}-Shift-drag", "draw outline, remove"), ("Drag / scroll", "move / zoom"),
-         ("Alt-click", "move spoke (file path)"), ("1 2 3 4 5 6", "cell, metaxylem, stele, file path, quarters, root"), (f"5, {CMD}-click a quarter", "drop it (click = back)"),
-         ("6, Shift-drag", "this outline is the root"),
+         ("1 2 3 4 5", "cell, metaxylem, stele, sectors, root"),
+         ("4, Shift-drag", "across damage: exclude that arc"), (f"4, {CMD}-click", "an excluded arc comes back"),
+         ("5, Shift-drag", "this outline is the root"),
          ("Shift-H", "hide / show outlines"), ("Shift-S", "save + next"), (", .", "previous / next image")]
 HELP = ("<table cellspacing='0' cellpadding='2' style='font-size:12px'>" +
         "".join(f"<tr><td style='color:#ffd479; padding-right:10px'><b>{k}</b></td><td>{v}</td></tr>"
@@ -393,6 +397,7 @@ class Reviewer:
         self.pick.changed.connect(lambda v: v and self.open(self._choices().index(v)))
         self.target_box = ComboBox(choices=list(TARGETS), value=self.target, label="editing")
         self.target_box.changed.connect(self.set_target)
+        self.reason_box = ComboBox(choices=list(P.SECTOR_REASONS), value="torn", label="reason")
         # two sliders instead of a box per layer: 0 hides, 1 is full strength
         self.img_op = FloatSlider(value=1.0, min=0, max=1.0, step=0.05, readout=False)
         self.img_op.changed.connect(lambda v: "image" in self.viewer.layers and
@@ -432,7 +437,7 @@ class Reviewer:
         bar = self.bar = WrapBar([group(opn, summ), self.prog_box,
                        group("µm/px", self.scale, self.scale_grp, scale_img),
                        group(self.pick, prev, nxt, save),
-                       group("editing", self.target_box, "opacity", self.ov_op),
+                       group("editing", self.target_box, "sector reason", self.reason_box, "opacity", self.ov_op),
                        group("image", self.img_op)])
         bar.dock = self.viewer.window.add_dock_widget(bar, area="top", name="Controls")
         bar.dock.setTitleBarWidget(QWidget())    # no close button: the bar can't be lost by accident
@@ -445,7 +450,7 @@ class Reviewer:
         self.dock.native.setMinimumWidth(240)   # no maximum: drag the panel edge to make it wider or narrower
         # live cortex pattern: cell size per quarter, by file and by distance from the stele
         self.fig = Figure(figsize=(3.2, 3.9), dpi=90, layout="constrained")
-        self.prof_axes = self.fig.subplots(2, 1)
+        self.prof_ax = self.fig.subplots(1, 1)
         self.canvas = FigureCanvasQTAgg(self.fig)
         self.canvas.setMinimumHeight(300)
         lay = self.dock.native.layout()
@@ -535,14 +540,12 @@ class Reviewer:
         self.mx = lab(mx, "metaxylem", {None: "red", 0: "transparent"}, 0.6)
         self.root = lab((region >= 1).astype(np.uint8), "root", {None: "lime", 0: "transparent"}, 0.9)
         self.root.contour = 3                   # the root's edge only
-        self.path = lab(np.zeros_like(cells), "file path", {None: "orangered", 0: "transparent"}, 0.55)
         self.cells = lab(cells, "cells", {None: "yellow", 0: "transparent"}, 0.9)
         self.cells.contour = 1
         self.air = lab(np.zeros_like(cells), "air spaces", {None: "magenta", 0: "transparent"}, 0.8)
-        self.quads = v.add_shapes(name="quadrants + spokes", face_color="transparent")
-        self.qlab = v.add_points(np.empty((0, 2)), name="quarter names", size=0)
+        self.sect = v.add_shapes(name="excluded sectors", face_color="transparent")
+        self.slab = v.add_points(np.empty((0, 2)), name="sector reasons", size=0)
         self.outline = v.add_shapes(name="outline", edge_color="white", edge_width=1.5, face_color="transparent")
-        self.nums = v.add_points(np.empty((0, 2)), name="file numbers", size=0)
         self.tag = v.add_points(np.empty((0, 2)), name="cursor", size=0)
         for lyr in v.layers[1:]:
             lyr.editable = False
@@ -550,13 +553,7 @@ class Reviewer:
         self._apply_overlays()
         v.layers.selection.active = self.cells
         self.centre = P.load_centre(f)          # None = the stele centroid
-        self.dropped = set(P.load_dropped(f))   # quarters left out (damaged tissue)
-        props, _, _ = P.derive(cells, region, mx, self.angle, self._centre())
-        saved = P.load_paths(f)
-        if saved is None:
-            self.spokes, self.path_q, self.path_cells = P.auto_paths(cells, region, props, self.angle, self._centre())
-        else:
-            self.spokes, self.path_q, self.path_cells = (np.array(a) for a in saved)
+        self.arcs = P.load_sectors(f, self.angle)   # excluded arcs (damaged tissue); old dropped quarters read as arcs
         self.set_target(self.target)
         self.recompute()
         um = P.um_per_px(self.dir, self.rel)
@@ -571,9 +568,8 @@ class Reviewer:
     def _state(self):
         """Everything an edit can change, to tell whether the open image was edited."""
         h = lambda a: hashlib.blake2b(np.ascontiguousarray(a).tobytes(), digest_size=16).digest()
-        return (h(self.cells.data), h(self.region.data), h(self.mx.data), h(np.asarray(self.spokes, float)),
-                tuple(np.asarray(self.path_q).tolist()), tuple(np.asarray(self.path_cells).tolist()),
-                tuple(sorted(self.dropped)), None if self.centre is None else tuple(np.asarray(self.centre).tolist()))
+        return (h(self.cells.data), h(self.region.data), h(self.mx.data), tuple(self.arcs),
+                None if self.centre is None else tuple(np.asarray(self.centre).tolist()))
 
     def keep(self):
         """Leaving an image (other image, other folder, Make results, closing) saves it if it was edited:
@@ -587,9 +583,7 @@ class Reviewer:
     def save(self):
         P.save_state(self.files[self.i], self.cells.data.astype(np.uint16), self.region.data.astype(np.uint8),
                      self.mx.data.astype(np.uint16), status="reviewed", image_file=self.rel,
-                     spokes=self.spokes, path_q=np.asarray(self.path_q, np.int16),
-                     path_cells=np.asarray(self.path_cells, np.int32),
-                     dropped_q=np.array(sorted(self.dropped), np.int16),
+                     **P.sector_arrays(self.arcs),
                      **({} if self.centre is None else {"centre": np.asarray(self.centre, float)}))
         self.status = "reviewed"
         self._opened = self._state()
@@ -612,67 +606,49 @@ class Reviewer:
     def recompute(self):
         cells, region = self.cells.data, self.region.data
         self.root.data = (region >= 1).astype(np.uint8)
-        props, _, tr = P.derive(cells, region, self.mx.data, self.angle, self._centre())
-        props = P.drop_quarters(props, self.dropped)            # graphs and file numbers leave them out
+        centre = self._centre()
+        props, _, tr = P.derive(cells, region, self.mx.data, self.angle, centre)
+        props = P.exclude_sectors(props, self.arcs)            # graphs and numbers leave excluded cells out
         self.props = props
+        st = P.sector_traits(cells, region, props, centre, self.arcs)
         self.air.data = np.isin(cells, props.label[props.tissue == "air_space"].values).astype(np.uint8)
-        ft = P.file_table(cells, region, props, self.path_q, self.path_cells, self.dropped)
-        self.path.data = np.isin(cells, ft.label.values).astype(np.uint8) if len(ft) else np.zeros_like(cells, np.uint8)
-        pr = props.set_index("label")
-        if len(ft):
-            self.nums.data = np.c_[pr.loc[ft.label, "y"].values, pr.loc[ft.label, "x"].values]
-            self.nums.features = {"file": ft.file.values.astype(int)}
-            self.nums.text = {"string": "{file}", "color": "white", "size": 9}
-        else:
-            self.nums.data = np.empty((0, 2))
-        cy, cx = self._centre()
+        cy, cx = centre
         L = 0.5 * max(self.gray.shape)
-        line = lambda t: np.array([[cy, cx], [cy - L * np.sin(np.radians(t)), cx + L * np.cos(np.radians(t))]])
-        self.quads.data = []
-        self.quads.add_lines([line(self.angle + 90 * k) for k in range(4)], edge_color="white", edge_width=1.2)
-        self.quads.add_lines([line(t) for q, t in enumerate(self.spokes, 1) if q not in self.dropped],
-                             edge_color="orange", edge_width=1.5)
-        for q in sorted(self.dropped):          # a dropped quarter is shaded grey
-            a = np.radians(self.angle + 90 * (q - 1) + np.linspace(0, 90, 19))
-            wedge = np.r_[[[cy, cx]], np.c_[cy - L * np.sin(a), cx + L * np.cos(a)]]
-            self.quads.add_polygons([wedge], face_color=[0.5, 0.5, 0.5, 0.45], edge_color="transparent")
-        # each quarter: a thin arc just outside the root edge, its name beyond it
-        _, r_root = P.radial_profile(region, (cy, cx))
-        r_root = np.convolve(np.r_[r_root[-10:], r_root, r_root[:10]], np.ones(21) / 21, "valid")   # smooth, wraps round
-        at = lambda t, r: [cy - r * np.sin(np.radians(t)), cx + r * np.cos(np.radians(t))]
-        pad = 0.02 * max(self.gray.shape)
-        names, spots = [], []
-        for q in (1, 2, 3, 4):
-            t0 = self.angle + 90 * (q - 1)
-            ts = np.arange(t0 + 3, t0 + 88, 2.0)
-            arc = np.array([at(t, r_root[int(np.mod(round(t), 360))] + pad) for t in ts])
-            self.quads.add_paths([arc], edge_color=[0.85, 0.85, 0.85, 0.35 if q in self.dropped else 0.8],
-                                 edge_width=1.5)
-            tm = t0 + 45
-            spots.append(at(tm, r_root[int(np.mod(round(tm), 360))] + 3.5 * pad))
-            names.append(f"Q{q}" + (" dropped" if q in self.dropped else ""))
-        self.qlab.data = np.array(spots)
-        self.qlab.features = {"q": names}
-        self.qlab.text = {"string": "{q}", "color": "white", "size": 12}
-        self.draw_profile(ft)
-        per_q = ft.groupby("quadrant").file.max().reindex([1, 2, 3, 4]).fillna(0).astype(int) if len(ft) else [0] * 4
+        self.sect.data = []
+        spots, names = [], []
+        for a0, a1, why in self.arcs:          # each excluded arc: a grey wedge, its reason at the middle
+            span = (a1 - a0) % 360 or 360
+            t = np.radians(a0 + np.linspace(0, span, max(3, int(span / 3))))
+            wedge = np.r_[[[cy, cx]], np.c_[cy - L * np.sin(t), cx + L * np.cos(t)]]
+            self.sect.add_polygons([wedge], face_color=[0.5, 0.5, 0.5, 0.45], edge_color="white", edge_width=1)
+            tm = np.radians(a0 + span / 2)
+            spots.append([cy - 0.6 * L * np.sin(tm), cx + 0.6 * L * np.cos(tm)])
+            names.append(f"{why}  ({span:.0f}°)")
+        self.slab.data = np.array(spots) if spots else np.empty((0, 2))
+        if spots:
+            self.slab.features = {"why": names}
+            self.slab.text = {"string": "{why}", "color": "white", "size": 11}
+        self.draw_profile()
+        flag = f"  ·  LOW: under {P.MIN_KEPT_DEG}°" if st["low_coverage"] else ""
+        lay = st["n_cortical_layers"]
         self.info.value = (f"{self.i + 1}/{len(self.files)}  ·  {self.status}\n"
-                           f"Files Q1-Q4:  {'/'.join(str(n) for n in per_q)}\n"
-                           f"Metaxylem {tr['mx_n']}  ·  air spaces {tr['n_air_spaces']}")
+                           f"Kept {st['angle_kept_deg']:.0f}°{flag}  ·  cortex cells {st['n_cortex_cells']}  ·  layers "
+                           f"{'-' if pd.isna(lay) else f'{lay:.0f}'} ({st['n_cortical_layers_min']}-{st['n_cortical_layers_max']})\n"
+                           f"Metaxylem {tr['mx_n']}  ·  air spaces {st['n_air_spaces']}")
 
-    def draw_profile(self, ft):
-        """Live cortex pattern: per quarter, along the spoke and all cortical cells (same as the result figures)."""
+    def draw_profile(self):
+        """Live cortex pattern (same as the result figures): kept cortical cells, median per radial bin,
+        epidermis its own point."""
         s = P.um_per_px(self.dir, self.rel)   # samples.xlsx, given by the user
         um = not np.isnan(s)
         s = s if um else 1
-        for ax in self.prof_axes:
-            ax.clear()
-        PP.quadrant_profiles(self.prof_axes, ft.assign(area=ft.area_px * s * s),
-                             self.props.assign(area=self.props.area_px * s * s), "area",
-                             "Cell area (µm²)" if um else "Cell area (px)", fontsize=7, compact=True)
-        for ax in self.prof_axes:
-            ax.tick_params(labelsize=7)
-            ax.xaxis.label.set_size(8), ax.yaxis.label.set_size(8), ax.title.set_size(8)
+        ax = self.prof_ax
+        ax.clear()
+        prof = P.sector_profile(self.props, SUM.N_BINS)
+        PP.sector_pattern(ax, prof.assign(y=prof.median_area_px * s * s), "y",
+                          "Cell area (µm²)" if um else "Cell area (px)", compact=True)
+        ax.tick_params(labelsize=7)
+        ax.xaxis.label.set_size(8), ax.yaxis.label.set_size(8)
         self.canvas.draw_idle()
 
     # ---------------------------------------------------------- mouse
@@ -709,7 +685,11 @@ class Reviewer:
                 yield
             self.viewer.camera.mouse_pan = True
             self.outline.data = []
-            if len(pts) >= 3:
+            if self.target == "Sectors":         # from one side of the damage to the other
+                if len(pts) >= 2:
+                    self.arcs = P.sector_edit(self.arcs, self._centre(), pts[0], pts[-1], self.reason_box.value)
+                    self.recompute()
+            elif len(pts) >= 3:
                 self.outline_edit(np.array(pts), remove)
             return
         dragged = False                     # plain drag pans; a click without movement edits
@@ -719,18 +699,9 @@ class Reviewer:
             yield
         if dragged:
             return
-        if "Alt" in mods and self.target == "File path":
-            self.move_spoke(*start)
-        else:
-            self.click_edit(*start, remove)
+        self.click_edit(*start, remove)
 
     # ---------------------------------------------------------- edits (same rules for every target)
-    def _path(self, pts, remove=False, move=False, m=None):
-        """File path edits: the shared rules (pipeline.path_edit, same as the web page)."""
-        self.spokes, self.path_q, self.path_cells = P.path_edit(
-            self.cells.data, self.region.data, self.props, self.spokes, self.path_q, self.path_cells,
-            self._centre(), self.angle, pts, remove, move, m)
-
     def click_edit(self, y, x, remove):
         cells, mx, region, t = self.cells.data, self.mx.data, self.region.data, self.target
         if t in ("Cell", "Metaxylem", "Stele", "Root"):    # same rules as the web page
@@ -738,13 +709,15 @@ class Reviewer:
             if note:
                 self.info.value += "\n" + note
                 return
-        elif t == "File path":
-            self._path((y, x), remove)
-        elif t == "Quarters":                       # Cmd/Ctrl-click = drop this quarter (damaged), click = back in
-            q = int(P.quadrant_of(y, x, self._centre(), self.angle))
-            self.dropped = self.dropped | {q} if remove else self.dropped - {q}
-            self._refresh()
-            self.info.value += f"\nQ{q} " + ("dropped from the results." if q in self.dropped else "in the results.")
+        elif t == "Sectors":                        # Cmd/Ctrl-click inside an excluded arc: it comes back
+            if remove:
+                n = len(self.arcs)
+                self.arcs = P.sector_edit(self.arcs, self._centre(), (y, x), remove=True)
+                self.recompute()
+                if len(self.arcs) < n:
+                    self.info.value += "\nThat arc is back in the results."
+            else:
+                self.info.value += "\nSectors: Shift-drag across the damage to exclude it."
             return
         self._refresh()
 
@@ -757,13 +730,7 @@ class Reviewer:
         cells, mx, region, t = self.cells.data, self.mx.data, self.region.data, self.target
         if t in ("Cell", "Metaxylem", "Stele", "Root"):
             P.outline_edit(cells, region, mx, t, m, remove)   # same rules as the web page
-        elif t == "File path":
-            self._path(None, remove, m=m)
         self._refresh()
-
-    def move_spoke(self, y, x):
-        self._path((y, x), move=True)
-        self.recompute()
 
     def _refresh(self):
         for lyr in (self.cells, self.mx, self.region):

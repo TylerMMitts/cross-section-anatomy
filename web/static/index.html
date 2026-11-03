@@ -176,15 +176,16 @@
     <button type="button" data-t="Cell"><i style="background:rgb(80,255,120)"></i>Cell<kbd>1</kbd></button>
     <button type="button" data-t="Metaxylem"><i style="background:rgb(255,60,60)"></i>Vessel<kbd>2</kbd></button>
     <button type="button" data-t="Stele" class="on"><i style="background:rgb(0,220,255)"></i>Stele<kbd>3</kbd></button>
-    <button type="button" data-t="File path"><i style="background:rgb(255,150,0)"></i>Path<kbd>4</kbd></button>
-    <button type="button" data-t="Quarters"><i style="background:#fff;outline:1px solid var(--muted)"></i>Quarter<kbd>5</kbd></button>
-    <button type="button" data-t="Root"><i style="background:rgb(255,220,0)"></i>Root<kbd>6</kbd></button>
+    <button type="button" data-t="Sectors"><i style="background:#888;outline:1px solid var(--muted)"></i>Sector<kbd>4</kbd></button>
+    <button type="button" data-t="Root"><i style="background:rgb(255,220,0)"></i>Root<kbd>5</kbd></button>
   </div>
   <div class="tip" id="tip"></div>
+  <div class="row" id="reasonRow" hidden><span style="width:52px">Reason</span><select id="reason" title="Why this arc is left out (technical damage only)">
+    <option>torn</option><option>folded</option><option>smeared / oblique</option><option>out of focus</option><option>debris</option><option>other</option></select></div>
   <div class="keys"><b>Drag</b> draws · <b>click</b> adds · hold <b>⌘/Ctrl</b> to remove instead</div>
   <div class="row view"><span style="width:44px">Cells</span><input type="range" id="opCells" min="0" max="1" step="0.05" value="1" title="Cell outlines">
     <button id="fitBtn" title="Fit the image (F)">Fit</button></div>
-  <div class="row view"><span style="width:44px">Masks</span><input type="range" id="opMasks" min="0" max="1" step="0.05" value="1" title="Root, stele, vessels, paths, quarters"><span style="width:36px"></span></div>
+  <div class="row view"><span style="width:44px">Masks</span><input type="range" id="opMasks" min="0" max="1" step="0.05" value="1" title="Root, stele, vessels, excluded sectors"><span style="width:36px"></span></div>
   <div class="msg" id="editMsg"></div>
 
   <section>
@@ -277,7 +278,7 @@ $("delYes").onclick = async () => {
     await api(`/api/projects/${enc(S.project)}`, { method: "DELETE" });
     clearTimeout(S.poll);
     $("delDlg").close();
-    Object.assign(S, { project: null, images: [], i: -1, gray: null, ovC: null, ovM: null, quarters: null, all: [] });
+    Object.assign(S, { project: null, images: [], i: -1, gray: null, ovC: null, ovM: null, sectors: null, all: [] });
     $("empty").hidden = false; $("imgFigLink").hidden = true; $("traitBars").innerHTML = ""; $("imgName").textContent = "–";
     draw();
     await loadProjects(); await openProject("");
@@ -358,9 +359,9 @@ async function show(k) {
   if (gone()) return;
   if (fresh || k !== S.shown) fit();               // a new image opens fitted; an edit keeps the zoom
   S.shown = k;
-  S.quarters = null;
+  S.sectors = null;
   draw();
-  if (im.status !== "not measured") S.quarters = (await api(`${base}/traits${q}`).catch(() => ({}))).quarters ?? null;
+  if (im.status !== "not measured") S.sectors = (await api(`${base}/traits${q}`).catch(() => ({}))).sectors ?? null;
   if (gone()) return;
   draw();
   imgFigure();
@@ -377,7 +378,7 @@ function imgFigure() {                            // this image's cortex pattern
 
 // ---------------------------------------------------------------- this image's traits: one small bar each
 const TRAITS = [   // label, value from the image's traits, kind (unit once the image has a scale)
-  ["Cell files", t => median(t.files_per_quarter.filter(n => n != null)), "n"],
+  ["Angle kept (°)", t => t.angle_kept_deg, "n"],
   ["Cortical cells", t => t.n_cortex_cells, "n"], ["Cortical layers", t => t.n_cortical_layers, "n"],
   ["Cortex width", t => t.cortex_width_px, "len"], ["Root area", t => t.root_area_px, "area"],
   ["Stele area", t => t.stele_area_px, "area"], ["Vessels", t => t.mx_n, "n"],
@@ -421,7 +422,7 @@ function draw() {
   ctx.drawImage(S.gray, x, y, S.gray.width * s, S.gray.height * s);
   for (const [ov, op] of [[S.ovC, "opCells"], [S.ovM, "opMasks"]])   // cells and masks fade separately
     if (ov && S.showOv) { ctx.globalAlpha = +$(op).value; ctx.drawImage(ov, x, y, ov.width * s, ov.height * s); ctx.globalAlpha = 1; }
-  if (S.quarters && S.showOv) drawQuarters();
+  if (S.sectors && S.showOv) drawSectors();
   if (S.pen && S.pen.moved && S.pen.pts.length > 1) {   // the outline being drawn (image px -> screen)
     ctx.beginPath();
     S.pen.pts.forEach(([py, px], k) => k ? ctx.lineTo(x + px * s, y + py * s) : ctx.moveTo(x + px * s, y + py * s));
@@ -431,39 +432,45 @@ function draw() {
     ctx.stroke(); ctx.setLineDash([]);
   }
 }
-function drawQuarters() {                         // as in the desktop app: white quarter lines, orange spokes
-  const { s, x, y } = S.view, { centre: [cy, cx], angle, dropped, spokes } = S.quarters;   // (the file paths),
-  const L = Math.max(S.gray.width, S.gray.height), R = 0.42 * Math.min(S.gray.width, S.gray.height);  // grey = dropped
+function drawSectors() {                          // as in the desktop app: excluded arcs as grey wedges + reason;
+  const { s, x, y } = S.view, { centre: [cy, cx], arcs } = S.sectors;   // while dragging a sector: its two edges
+  const L = Math.max(S.gray.width, S.gray.height), R = 0.42 * Math.min(S.gray.width, S.gray.height);
   const at = (t, r) => [x + (cx + r * Math.cos(t * Math.PI / 180)) * s, y + (cy - r * Math.sin(t * Math.PI / 180)) * s];
+  const ang = ([py, px]) => ((Math.atan2(-(py - cy), px - cx) * 180 / Math.PI) + 360) % 360;
   ctx.save(); ctx.globalAlpha = +$("opMasks").value;
-  ctx.beginPath(); ctx.rect(x, y, S.gray.width * s, S.gray.height * s); ctx.clip();   // lines stop at the image edge
-  for (const q of dropped) {
+  ctx.beginPath(); ctx.rect(x, y, S.gray.width * s, S.gray.height * s); ctx.clip();   // wedges stop at the image edge
+  const wedge = (a0, span, fill) => {
     ctx.beginPath(); ctx.moveTo(...at(0, 0));
-    for (let k = 0; k <= 18; k++) ctx.lineTo(...at(angle + 90 * (q - 1) + 5 * k, L));
-    ctx.closePath(); ctx.fillStyle = "rgba(128,128,128,0.5)"; ctx.fill();
-  }
-  const ray = (t, color, w) => { ctx.beginPath(); ctx.moveTo(...at(t, 0)); ctx.lineTo(...at(t, L)); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke(); };
-  for (let k = 0; k < 4; k++) ray(angle + 90 * k, "rgba(255,255,255,0.9)", 1.5);
-  spokes.forEach((t, k) => { if (!dropped.includes(k + 1)) ray(t, "rgba(255,150,0,0.9)", 1.5); });
+    for (let k = 0; k <= 36; k++) ctx.lineTo(...at(a0 + span * k / 36, L));
+    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 1; ctx.stroke();
+  };
   ctx.font = "600 13px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  for (let q = 1; q <= 4; q++) {
-    const [lx, ly] = at(angle + 90 * (q - 1) + 45, R), txt = "Q" + q + (dropped.includes(q) ? " dropped" : "");
+  for (const [a0, a1, why] of arcs) {
+    const span = ((a1 - a0) % 360 + 360) % 360 || 360;
+    wedge(a0, span, "rgba(128,128,128,0.5)");
+    const [lx, ly] = at(a0 + span / 2, R), txt = `${why} (${Math.round(span)}°)`;
     ctx.fillStyle = "rgba(0,0,0,0.6)"; const w = ctx.measureText(txt).width + 10; ctx.fillRect(lx - w / 2, ly - 10, w, 20);
     ctx.fillStyle = "#fff"; ctx.fillText(txt, lx, ly);
+  }
+  if (S.pen && S.pen.moved && S.target === "Sectors" && !S.pen.remove && S.pen.pts.length > 1) {   // the arc to come:
+    const t0 = ang(S.pen.pts[0]), t1 = ang(S.pen.pts[S.pen.pts.length - 1]), d = ((t1 - t0) % 360 + 360) % 360;
+    if (Math.min(d, 360 - d) >= 2) d <= 180 ? wedge(t0, d, "rgba(255,90,90,0.25)") : wedge(t1, 360 - d, "rgba(255,90,90,0.25)");
   }
   ctx.restore();
 }
 
 // ---------------------------------------------------------------- editing: drag draws, click adds, ⌘/Ctrl removes
 const COLOR = { Cell: "rgb(80,255,120)", Metaxylem: "rgb(255,60,60)", Stele: "rgb(0,220,255)",
-                "File path": "rgb(255,150,0)", Root: "rgb(255,220,0)", Quarters: "#fff" };
+                Root: "rgb(255,220,0)", Sectors: "#fff" };
 const TIP = {
   Cell: "Click inside a cell to fill it, or draw around one. ⌘/Ctrl-click removes a cell, ⌘/Ctrl-drag clears an area.",
   Metaxylem: "Click inside a vessel to fill it, or draw around one. ⌘/Ctrl-click removes a vessel.",
   Stele: "Draw the stele outline: it replaces the old one. ⌘/Ctrl-drag cuts an area out of the stele.",
   Root: "Draw the root outline: it replaces the old one. ⌘/Ctrl-drag cuts an area out of the root.",
-  "File path": "Click a cell to add it to (or take it off) its quarter's path; draw around cells to add them. Alt-click moves that quarter's spoke.",
-  Quarters: "⌘/Ctrl-click a damaged quarter to leave it out of the results; click it to bring it back."};
+  Sectors: "The whole section counts. Drag around the stele from one side of damaged tissue to the other: that arc is left out " +
+           "(the smaller way round; a wider one takes two drags). ⌘/Ctrl-click a grey arc to bring it back. Technical damage only: " +
+           "aerenchyma and odd cells are biology, measured, not removed. Stele and vessels always count whole."};
 function toImg(e) {                              // screen -> image pixel (y, x)
   const r = cv.getBoundingClientRect(), { s, x, y } = S.view;
   return [(e.clientY - r.top - y) / s, (e.clientX - r.left - x) / s];
@@ -472,15 +479,16 @@ function setTarget(t) {
   S.target = t;
   document.querySelectorAll("#target button").forEach(b => b.classList.toggle("on", b.dataset.t === t));
   $("tip").textContent = TIP[t];
+  $("reasonRow").hidden = t !== "Sectors";
 }
 $("target").onclick = e => { const b = e.target.closest("button"); if (b) setTarget(b.dataset.t); };
-async function applyEdit(pts, remove, move) {
+async function applyEdit(pts, remove) {
   const im = S.images[S.i];
   S.saving = true; $("editMsg").textContent = "Saving…";
   try {
     const r = await api(`/api/projects/${enc(S.project)}/edit`, form({ rel: im.image, target: S.target,
       points: JSON.stringify(pts.map(([py, px]) => [Math.round(py * 10) / 10, Math.round(px * 10) / 10])),
-      remove, move: !!move }));
+      remove, reason: $("reason").value }));
     im.status = "reviewed";
     S.pen = null;
     await show(S.i);                             // new outlines, graph and traits
@@ -501,13 +509,13 @@ cv.addEventListener("pointerdown", e => {
   const panning = S.space || e.button === 1 || e.button === 2 || !editable();   // Space, middle or right button: move
   if (panning) { S.pan = { x: e.clientX, y: e.clientY }; cv.classList.add("pan"); return; }
   showErr("");
-  S.pen = { pts: [toImg(e)], remove: e.ctrlKey || e.metaKey, move: e.altKey && S.target === "File path",
+  S.pen = { pts: [toImg(e)], remove: e.ctrlKey || e.metaKey,
             live: true, moved: false, x0: e.clientX, y0: e.clientY, last: [e.clientX, e.clientY] };
 });
 cv.addEventListener("pointermove", e => {
   if (S.pan) { S.view.x += e.clientX - S.pan.x; S.view.y += e.clientY - S.pan.y; S.pan = { x: e.clientX, y: e.clientY }; draw(); return; }
   if (!S.pen || !S.pen.live) return;
-  if (!S.pen.moved && Math.hypot(e.clientX - S.pen.x0, e.clientY - S.pen.y0) >= 4) S.pen.moved = S.target !== "Quarters";
+  if (!S.pen.moved && Math.hypot(e.clientX - S.pen.x0, e.clientY - S.pen.y0) >= 4) S.pen.moved = !(S.target === "Sectors" && S.pen.remove);
   const [lx, ly] = S.pen.last;
   if (S.pen.moved && Math.hypot(e.clientX - lx, e.clientY - ly) >= 3) { S.pen.pts.push(toImg(e)); S.pen.last = [e.clientX, e.clientY]; draw(); }
 });
@@ -516,15 +524,16 @@ cv.addEventListener("pointerup", () => {
   const p = S.pen;
   if (!p || !p.live) return;
   p.live = false; draw();
-  if (!p.moved) applyEdit([p.pts[0]], p.remove, p.move);         // a click
-  else if (p.pts.length >= 3) applyEdit(p.pts, p.remove, false);  // a drawn outline
+  if (!p.moved) applyEdit([p.pts[0]], p.remove);                  // a click
+  else if (S.target === "Sectors" && p.pts.length >= 2) applyEdit([p.pts[0], p.pts[p.pts.length - 1]], false);  // an arc
+  else if (p.pts.length >= 3) applyEdit(p.pts, p.remove);           // a drawn outline
   else S.pen = null;
 });
 cv.addEventListener("contextmenu", e => e.preventDefault());   // Ctrl-click on a Mac must not open a menu
 new ResizeObserver(() => { if (S.gray) fit(); draw(); }).observe(cv);   // the image area changed size: refit
 $("opCells").oninput = $("opMasks").oninput = draw;
 $("fitBtn").onclick = () => { if (S.gray) { fit(); draw(); } };
-const KEYS = { 1: "Cell", 2: "Metaxylem", 3: "Stele", 4: "File path", 5: "Quarters", 6: "Root" };
+const KEYS = { 1: "Cell", 2: "Metaxylem", 3: "Stele", 4: "Sectors", 5: "Root" };
 addEventListener("keydown", e => {
   if (["INPUT", "SELECT"].includes(e.target.tagName)) return;
   if (e.key === " ") { e.preventDefault(); S.space = true; cv.classList.add("pan"); }

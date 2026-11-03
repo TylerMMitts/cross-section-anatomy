@@ -3,7 +3,7 @@
   python run_batch.py <image_dir> [<out_dir>] [--diameter D] [--redo]
 
 out_dir defaults to <image_dir>/../anatomy and gets
-  settings.json       image_dir (relative), cell diameter, quadrant angle
+  settings.json       image_dir (relative), cell diameter, quadrant angle (only to read old dropped quarters as sectors)
   samples.xlsx        one row per image: fill um_per_px (the scale; always given by the user), plant, groups
   masks/<key>.npz     editable state per image (status "auto" until saved in review.py)
   qc/<key>.png        overlay to eyeball the proposal
@@ -91,12 +91,10 @@ def batch(image_dir, out_dir=None, diameter=None, redo=False, on_start=None, pro
             on_start(i, len(imgs), rel)
         t = time.time()
         gray, cells, region, mx = propose(image_dir / rel, s.get("diameter"))
-        props, _, tr = P.derive(cells, region, mx, s.get("quadrant_angle_deg", 0))
-        spokes, pq, pc = P.auto_paths(cells, region, props, s.get("quadrant_angle_deg", 0))
-        P.save_state(npz, cells, region, mx, status="auto", image_file=rel.as_posix(),
-                     spokes=spokes, path_q=pq, path_cells=pc)
+        props, _, tr = P.derive(cells, region, mx)
+        P.save_state(npz, cells, region, mx, status="auto", image_file=rel.as_posix())   # whole section kept
         P.qc_png(gray, cells, region, mx, props, tr, out / "qc" / f"{key}.png", str(rel))
-        yield i, len(imgs), (f"{rel.as_posix()}  files={'/'.join(str(int((pq == q).sum())) for q in (1, 2, 3, 4))} "
+        yield i, len(imgs), (f"{rel.as_posix()}  layers={tr['n_cortical_layers']:.0f} "
                              f"mx={tr['mx_n']}  {time.time() - t:.0f}s")
     S.write_samples(out)
     return out
