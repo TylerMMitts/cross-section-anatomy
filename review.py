@@ -448,7 +448,7 @@ class Reviewer:
         self.info.native.setWordWrap(True)
         self.info.native.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.dock.native.setMinimumWidth(240)   # no maximum: drag the panel edge to make it wider or narrower
-        # live cortex pattern: cell size per quarter, by file and by distance from the stele
+        # live cortex pattern: median cell size per radial bin of the kept cortex, epidermis its own point
         self.fig = Figure(figsize=(3.2, 3.9), dpi=90, layout="constrained")
         self.prof_ax = self.fig.subplots(1, 1)
         self.canvas = FigureCanvasQTAgg(self.fig)

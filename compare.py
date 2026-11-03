@@ -20,13 +20,14 @@ import numpy as np
 import pandas as pd
 
 TRAITS = {                                        # per_image column -> plain name
-    "n_files": "cortical cell files (median of quarters)",
+    "n_cortical_layers": "cortical layers (median over rays)",
+    "angle_kept_deg": "degrees of the section kept",
     "n_cortex_cells": "cortical cells",
     "mean_cortex_cell_area_px": "mean cortical cell area (px)",
     "cortex_width_px": "cortex width (px)",
     "root_area_px": "root area (px)",
     "stele_area_px": "stele area (px)",
-    "cortex_area_px": "cortex area (px)",
+    "cortex_area_kept_px": "cortex area, kept angles (px)",
     "mx_n": "metaxylem vessels",
     "mx_mean_area_px": "mean metaxylem area (px)",
     "n_air_spaces": "air spaces",
