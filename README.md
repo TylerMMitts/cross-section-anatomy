@@ -196,6 +196,10 @@ Everything else is derived by `derive()`, so the editor and the summary always a
    segmentation gap. Look before using the number.
 - **Replicate** = `plant` in samples.xlsx; per_plant averages that plant's images.
 
+## Development protocols
+
+Why the measurements are defined the way they are, and how they differ from earlier lab pipelines: [docs/development/](docs/development/README.md).
+
 ## Status (2026-11-02)
 
 - Auto pass run on all 71 SL-2026-004 images (~15–40 s each on M-series MPS).
