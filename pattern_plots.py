@@ -1,10 +1,9 @@
 """Cortex pattern figures and profile features, called by summarise.py (and live by review.py).
 
-Two views of cortical cell size, both on a 0-1 axis from the stele outward
-(plan: 5_Projects/04_root_anatomy/01_Cortex patterning/6_cortical_radial_profile_analysis/):
-  spoke   the path cells of each quarter's spoke, x = relative file position (file - 0.5) / files in the quarter
-  radial  every cortical cell, x = r_norm, radial position (0 = stele edge, 1 = root edge along the cell's own
-          direction), cells pooled into N_BINS equal bins
+The cortex pattern (sectors, 2026-11-02): every cortical cell in the kept angles (counted by its centre), x = r_norm
+(0 = stele edge, 1 = root edge along the cell's own direction), N_BINS equal bins, MEDIAN area per bin; the epidermis
+is its own point past 1 (a different tissue: never joined to the cortex curve). Replaced one spoke per quarter, which
+on R1 was far noisier (split-half r 0.52 vs 0.87; 04_root_anatomy 12_sector_vs_spoke).
 Curves are cubic smoothing splines, smoothness by generalised cross-validation
 (scipy.interpolate.make_smoothing_spline): no assumed shape, nothing to tune.
 """
@@ -17,14 +16,12 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import make_smoothing_spline
 
-QCOL = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}   # validated CVD-safe; every line is labelled
-GCOL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+GCOL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]   # validated CVD-safe; every line is labelled
 INK, MUTED, GRID = "#222222", "#8a8a85", "#ebebe8"
 N_BINS = 10
 MIN_PTS = 5       # fewer points than this: no spline
+EPI_X = 1.13     # where the epidermis point is drawn (display only; its own tissue, past the cortex)
 DECAY_WIN = 0.2   # decay slope measured over this fraction of the x-range just past the peak
-VIEWS = {"spoke": ("rel_position", "Along the spoke", "Relative file position (stele → epidermis)"),
-         "radial": ("r_bin", "All cortical cells", "Radial position (stele edge → epidermis)")}
 plt.rcParams.update({"font.size": 10, "font.family": "sans-serif", "axes.spines.top": False,
                      "axes.spines.right": False, "axes.edgecolor": MUTED, "axes.labelcolor": INK,
                      "xtick.color": MUTED, "ytick.color": MUTED, "axes.titleweight": "bold",
@@ -72,18 +69,6 @@ def profile_features(x, y, w=None) -> dict:
     return out
 
 
-def with_rel(ft):
-    if "rel_position" in ft:
-        return ft
-    return ft.assign(rel_position=(ft.file - 0.5) / ft.groupby("quadrant").file.transform("max"))
-
-
-def with_bin(cells):
-    """Cortical cells only, r_norm in N_BINS equal bins, plotted at the bin centre."""
-    c = cells[cells.tissue == "cortex"]
-    return c.assign(r_bin=(np.clip(c.r_norm, 0, 0.999) * N_BINS).astype(int) / N_BINS + 0.5 / N_BINS)
-
-
 # ---------------------------------------------------------------- drawing helpers
 def _end_labels(ax, items, fontsize=9):
     """Direct labels at line ends, nudged apart vertically so they never sit on each other."""
@@ -101,7 +86,7 @@ def _axes(ax, title, xl, y_lab):
     ax.set_title(title, pad=8)
     ax.set_xlabel(xl)
     ax.set_ylabel(y_lab)
-    ax.set_xlim(0, 1.18)
+    ax.set_xlim(0, 1.22)
     ax.set_xticks([0, 0.25, 0.5, 0.75, 1])
     ax.grid(axis="y", color=GRID, lw=0.8)
     ax.set_ylim(bottom=0)
@@ -117,81 +102,78 @@ def _curve(ax, x, y, w, color, lw=2.2, dots=True, ms=4):
     return (x.iloc[-1], y.iloc[-1]) if len(x) else None
 
 
-def quadrant_profiles(axs, ft, cells, y_col, y_lab, fontsize=9, compact=False):
-    """One image: per quarter (colour, QC) and pooled over the quarters (black: the image's curve, the one
-    the features come from), for the spoke and for all cortical cells. Also drawn live in review.py.
-    ft: file_table rows; cells: derive() props (tissue, quadrant, r_norm, y_col)."""
-    ft, cb = with_rel(ft), with_bin(cells)
-    for ax, (view, d_all) in zip(axs, (("spoke", ft), ("radial", cb))):
-        x, title, xl = VIEWS[view]
-        ends = []
-        for q, d in d_all.groupby("quadrant"):
-            if view == "radial":
-                d = d.groupby(x)[y_col].agg(["mean", "size"]).reset_index().rename(columns={"mean": y_col})
-                e = _curve(ax, d[x], d[y_col], d["size"], QCOL[q], lw=1.1, ms=3)
-            else:
-                d = d.sort_values(x)
-                e = _curve(ax, d[x], d[y_col], None, QCOL[q], lw=1.1, ms=3.5)
-            if e:
-                ends.append((*e, f"Q{q}"))
-        if view == "radial":
-            pooled = d_all.groupby(x)[y_col].agg(["mean", "size"])
-            sp = spline(pooled.index, pooled["mean"], pooled["size"])
-        else:
-            sp = spline(d_all[x], d_all[y_col])
-        if sp is not None:                      # the image's own curve: all four quarters pooled
-            ax.plot(*sp, color=INK, lw=2.6, alpha=0.85)
-            ends.append((sp[0][-1], sp[1][-1], "image"))
-        _axes(ax, title, "Stele → epidermis (0-1)" if compact else xl, y_lab)
-        _end_labels(ax, ends, fontsize)
+def sector_pattern(ax, prof, y_col, y_lab, color=INK, label=None, compact=False):
+    """One image's cortex pattern on ax: bin medians (dots; open = few cells), the spline through the cortex bins
+    (the curve the features come from), and the epidermis as its own square past 1, never joined to the curve.
+    prof: pipeline.sector_profile rows (+ y_col). Also drawn live by review.py and the web page."""
+    cx = prof[prof.bin != "epidermis"].dropna(subset=[y_col])
+    ok = cx[~cx.few_cells]
+    ax.plot(ok.x, ok[y_col], lw=0, marker="o", ms=5, color=color, alpha=0.8)
+    few = cx[cx.few_cells]
+    ax.plot(few.x, few[y_col], lw=0, marker="o", ms=5, mfc="none", mec=color, alpha=0.8)
+    sp = spline(cx.x, cx[y_col], cx.n_cells.where(cx.n_cells > 0))
+    if sp is not None:
+        ax.plot(*sp, color=color, lw=2.4, solid_capstyle="round", label=label)
+    e = prof[(prof.bin == "epidermis")].dropna(subset=[y_col])
+    if len(e):
+        ax.plot([EPI_X] * len(e), e[y_col], lw=0, marker="s", ms=7, color=color)
+    _axes(ax, "" if compact else "Cortex, stele → epidermis", "Stele → epidermis (0-1)" if compact else
+          "Radial position (0 = stele edge, 1 = root edge)", y_lab)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1, EPI_X])
+    ax.set_xticklabels(["0", "0.25", "0.5", "0.75", "1", "epi"])
 
 
 # ---------------------------------------------------------------- figures
-def image_figure(ft, props, y_col, y_lab, title, out):
-    """One image's cortex pattern: cell size along the spoke and across all cortical cells, per quarter."""
-    fig, bs = plt.subplots(1, 2, figsize=(10, 4.4))
-    quadrant_profiles(bs, ft, props, y_col, y_lab)
+def image_figure(prof, y_lab, title, out):
+    """One image's cortex pattern (prof: sector_profile with a y column)."""
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    sector_pattern(ax, prof, "y", y_lab)
     fig.suptitle(title, x=0.01, ha="left", fontsize=10, color=MUTED)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.text(0.01, 0.005, "Dots: median per bin (open: fewer than 5 cells). Square: epidermis, its own point.",
+             fontsize=8, color=MUTED)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     fig.savefig(out, dpi=200)
     plt.close(fig)
 
 
-def group_figure(pf, cells, group_col, species, y_col, y_lab, out, note=""):
-    """pf: per_file_path rows, cells: all_cells rows, one species. Plant = replicate: its quarters and images are
-    averaged within each x bin first. Thin = one spline per plant; bold = spline through the plant means
-    (weighted by plants), band = ± 1 SE across plants; only bins with >= 3 plants."""
-    pf = with_rel(pf).assign(rel_bin=lambda d: (np.clip(d.rel_position, 0, 0.999) * N_BINS).astype(int) / N_BINS
-                             + 0.5 / N_BINS)
-    cb = with_bin(cells)
-    fig, axs = plt.subplots(1, 2, figsize=(11, 4.4), sharey=True)
-    groups = sorted(set(pf[group_col].dropna()) | set(cb[group_col].dropna()), key=str)
-    for ax, (view, d_all, xb) in zip(axs, (("spoke", pf, "rel_bin"), ("radial", cb, "r_bin"))):
-        _, title, xl = VIEWS[view]
-        ends = []
-        plant = d_all.groupby([group_col, "plant", xb])[y_col].mean().reset_index()
-        for g, d in plant.groupby(group_col):
-            c = GCOL[groups.index(g) % len(GCOL)]
-            for _, p in d.groupby("plant"):
-                sp = spline(p[xb], p[y_col])
-                if sp is not None:
-                    ax.plot(*sp, color=c, lw=0.6, alpha=0.22)
-            m = d.groupby(xb)[y_col].agg(["mean", "std", "size"]).reset_index()
-            m = m[m["size"] >= 3]
-            if not len(m):
-                continue
-            se = m["std"] / np.sqrt(m["size"])
-            lo, hi = spline(m[xb], m["mean"] - se, m["size"]), spline(m[xb], m["mean"] + se, m["size"])
+def group_figure(pip, group_col, species, y_col, y_lab, out, note=""):
+    """pip: per_image_profile rows of one species. Plant = replicate: its images are averaged per bin first.
+    Thin = one spline per plant; bold = spline through the plant means (weighted by plants), band = ± 1 SE across
+    plants, bins with >= 3 plants; square ± SE = epidermis, its own point."""
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    groups = sorted(pip[group_col].dropna().unique(), key=str)
+    plant = pip.groupby([group_col, "plant", "bin", "x_position"])[y_col].mean().reset_index()
+    ends = []
+    for g, d in plant.groupby(group_col):
+        c = GCOL[groups.index(g) % len(GCOL)]
+        cx, ep = d[d.bin != "epidermis"], d[d.bin == "epidermis"]
+        for _, p in cx.groupby("plant"):
+            sp = spline(p.x_position, p[y_col])
+            if sp is not None:
+                ax.plot(*sp, color=c, lw=0.6, alpha=0.22)
+        m = cx.groupby("x_position")[y_col].agg(["mean", "std", "count"]).reset_index()
+        m = m[m["count"] >= 3]
+        if len(m):
+            se = m["std"] / np.sqrt(m["count"])
+            lo = spline(m.x_position, m["mean"] - se, m["count"])
+            hi = spline(m.x_position, m["mean"] + se, m["count"])
             if lo is not None and hi is not None:
                 ax.fill_between(lo[0], lo[1], hi[1], color=c, alpha=0.15, lw=0)
-            e = _curve(ax, m[xb], m["mean"], m["size"], c, lw=2.8, ms=5)
+            e = _curve(ax, m.x_position, m["mean"], m["count"], c, lw=2.8, ms=5)
             if e:
                 ends.append((*e, f"{g}  (n = {d.plant.nunique()})"))
-        _axes(ax, title, xl, y_lab if ax is axs[0] else "")
-        _end_labels(ax, ends, 10)
+        em = ep[y_col].dropna()
+        if len(em):
+            ax.errorbar(EPI_X + 0.012 * groups.index(g), em.mean(),
+                        yerr=em.std() / np.sqrt(len(em)) if len(em) > 1 else None, fmt="s", ms=7, color=c, capsize=3)
+    _axes(ax, "", "Radial position (0 = stele edge, 1 = root edge)", y_lab)
+    ax.set_xlim(0, 1.3)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1, EPI_X])
+    ax.set_xticklabels(["0", "0.25", "0.5", "0.75", "1", "epi"])
+    _end_labels(ax, ends, 10)
     fig.suptitle(species, x=0.01, ha="left", fontsize=13, fontweight="bold", color=INK)
-    fig.text(0.01, 0.005, "Bold: spline through plant means (dots), band ± 1 SE across plants. Thin: one plant. "
-             f"Bins with ≥ 3 plants.{note}", fontsize=8, color=MUTED)
-    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.text(0.01, 0.005, "Bold: spline through plant means (dots), band ± 1 SE across plants (bins with ≥ 3 plants). "
+             f"Thin: one plant. Square: epidermis.{note}", fontsize=8, color=MUTED)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     fig.savefig(out, dpi=200)
     plt.close(fig)
